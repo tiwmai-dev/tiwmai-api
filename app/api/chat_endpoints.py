@@ -3,11 +3,18 @@
 from typing import Optional
 
 from fastapi import Depends, File, Form, HTTPException, UploadFile
+from fastapi.security import HTTPAuthorizationCredentials
 
 from app.core.exceptions import BaseAPIException
 from app.core.logging import app_logger
 from app.models.schemas import ChatResponse
 from app.services.chat_service import ChatService
+from app.services.student_auth_service import StudentAuthService
+from app.api.student_handlers import (
+    STUDENT_BEARER_OPTIONAL,
+    _get_student_auth_service,
+    _require_user_matches_token,
+)
 
 
 async def get_chat_service() -> ChatService:
@@ -28,11 +35,19 @@ async def send_chat_message(
         "study_solver", description="Chat mode: study_solver|learning_advisor"
     ),
     image: Optional[UploadFile] = File(None, description="Optional image attachment"),
+    credentials: Optional[HTTPAuthorizationCredentials] = Depends(STUDENT_BEARER_OPTIONAL),
+    student_auth_service: StudentAuthService = Depends(_get_student_auth_service),
     chat_service: ChatService = Depends(get_chat_service),
 ) -> ChatResponse:
     """Send a message to the AI chat assistant."""
     try:
         app_logger.info(f"Processing chat message from user {user_id}")
+
+        await _require_user_matches_token(
+            user_id=user_id,
+            credentials=credentials,
+            auth_service=student_auth_service,
+        )
 
         if len(message.strip()) == 0:
             raise HTTPException(status_code=400, detail="Message cannot be empty")

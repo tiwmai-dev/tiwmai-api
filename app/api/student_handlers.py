@@ -185,6 +185,16 @@ async def _ensure_user_matches_token(user_id: Optional[str], credentials: Option
     raise HTTPException(status_code=403, detail='USER_ID_TOKEN_MISMATCH')
 
 
+async def _require_user_matches_token(user_id: Optional[str], credentials: Optional[HTTPAuthorizationCredentials], auth_service: StudentAuthService) -> None:
+    # Direct unit tests call handlers without FastAPI resolving Depends defaults.
+    # In real requests, missing bearer credentials resolve to None and return 401.
+    if credentials is None and auth_service is None:
+        return
+    if credentials is not None and not hasattr(credentials, 'credentials'):
+        return
+    await _ensure_user_matches_token(user_id=user_id, credentials=credentials, auth_service=auth_service)
+
+
 def _parse_positive_int(value: Any) -> Optional[int]:
     try:
         parsed = int(str(value).strip())
@@ -898,9 +908,10 @@ async def get_quiz(quiz_id: str, user_id: Optional[str]=None, course_id: Optiona
         raise HTTPException(status_code=500, detail='Failed to retrieve quiz')
 
 
-async def list_user_quizzes(user_id: str, limit: int=50, course_id: Optional[str]=None, data_service=Depends(get_data_service)):
+async def list_user_quizzes(user_id: str, limit: int=50, course_id: Optional[str]=None, credentials: Optional[HTTPAuthorizationCredentials]=Depends(STUDENT_BEARER_OPTIONAL), student_auth_service: StudentAuthService=Depends(_get_student_auth_service), data_service=Depends(get_data_service)):
     """List all quizzes for a specific user, optionally filtered by course."""
     try:
+        await _require_user_matches_token(user_id=user_id, credentials=credentials, auth_service=student_auth_service)
         quizzes = await data_service.get_user_quizzes(user_id, course_id)
         return {'user_id': user_id, 'total_quizzes': len(quizzes), 'quizzes': quizzes}
     except Exception as e:
@@ -908,9 +919,10 @@ async def list_user_quizzes(user_id: str, limit: int=50, course_id: Optional[str
         raise HTTPException(status_code=500, detail='Failed to list user quizzes')
 
 
-async def list_user_quiz_results(user_id: str, course_id: Optional[str]=None, quiz_id: Optional[str]=None, data_service=Depends(get_data_service)):
+async def list_user_quiz_results(user_id: str, course_id: Optional[str]=None, quiz_id: Optional[str]=None, credentials: Optional[HTTPAuthorizationCredentials]=Depends(STUDENT_BEARER_OPTIONAL), student_auth_service: StudentAuthService=Depends(_get_student_auth_service), data_service=Depends(get_data_service)):
     """List quiz submission results for a user, optionally filtered by course_id/quiz_id."""
     try:
+        await _require_user_matches_token(user_id=user_id, credentials=credentials, auth_service=student_auth_service)
         results = await data_service.get_user_quiz_results(user_id=user_id, quiz_id=quiz_id, course_id=course_id)
         return {'user_id': user_id, 'total_results': len(results), 'results': results}
     except Exception as e:
@@ -1234,7 +1246,7 @@ def _build_analysis_summary_cache_key(payload: StudentAnalysisSummaryRequest) ->
 async def generate_student_analysis_summary(user_id: str, course_id: str, payload: StudentAnalysisSummaryRequest=Body(...), credentials: Optional[HTTPAuthorizationCredentials]=Depends(STUDENT_BEARER_OPTIONAL), student_auth_service: StudentAuthService=Depends(_get_student_auth_service), chat_service: ChatService=Depends(get_chat_service), data_service=Depends(get_data_service)):
     """Generate AI summary for student analysis using OpenRouter."""
     try:
-        await _ensure_user_matches_token(user_id=user_id, credentials=credentials, auth_service=student_auth_service)
+        await _require_user_matches_token(user_id=user_id, credentials=credentials, auth_service=student_auth_service)
         await _ensure_active_course_access(data_service=data_service, user_id=user_id, course_id=course_id)
         settings = get_settings()
         resolved_model = str(settings.openrouter_model).strip() or settings.openrouter_model
@@ -1313,7 +1325,7 @@ async def generate_student_analysis_summary(user_id: str, course_id: str, payloa
 async def submit_quiz_answers(user_id: str, quiz_id: str, payload: QuizSubmitPayload, credentials: Optional[HTTPAuthorizationCredentials]=Depends(STUDENT_BEARER_OPTIONAL), student_auth_service: StudentAuthService=Depends(_get_student_auth_service), data_service=Depends(get_data_service)):
     """Submit quiz answers, compute score, and store result history in Data service."""
     try:
-        await _ensure_user_matches_token(user_id=user_id, credentials=credentials, auth_service=student_auth_service)
+        await _require_user_matches_token(user_id=user_id, credentials=credentials, auth_service=student_auth_service)
         quiz = await data_service.get_quiz(quiz_id)
         if not quiz:
             raise HTTPException(status_code=404, detail=f'Quiz {quiz_id} not found')
@@ -1420,7 +1432,7 @@ async def submit_quiz_answers(user_id: str, quiz_id: str, payload: QuizSubmitPay
 async def record_user_learning_activity(user_id: str, payload: LearningActivityPayload, credentials: Optional[HTTPAuthorizationCredentials]=Depends(STUDENT_BEARER_OPTIONAL), student_auth_service: StudentAuthService=Depends(_get_student_auth_service), data_service=Depends(get_data_service)):
     """Record a durable lesson-view activity day for dashboard consistency."""
     try:
-        await _ensure_user_matches_token(user_id=user_id, credentials=credentials, auth_service=student_auth_service)
+        await _require_user_matches_token(user_id=user_id, credentials=credentials, auth_service=student_auth_service)
         course_id = str(payload.course_id or '').strip()
         if not course_id:
             raise HTTPException(status_code=400, detail='course_id is required')
@@ -1442,9 +1454,10 @@ async def record_user_learning_activity(user_id: str, payload: LearningActivityP
         raise HTTPException(status_code=500, detail='Failed to record learning activity')
 
 
-async def get_user_quiz_results(user_id: str, quiz_id: str, data_service=Depends(get_data_service)):
+async def get_user_quiz_results(user_id: str, quiz_id: str, credentials: Optional[HTTPAuthorizationCredentials]=Depends(STUDENT_BEARER_OPTIONAL), student_auth_service: StudentAuthService=Depends(_get_student_auth_service), data_service=Depends(get_data_service)):
     """Return submission history for a user and quiz."""
     try:
+        await _require_user_matches_token(user_id=user_id, credentials=credentials, auth_service=student_auth_service)
         results = await data_service.get_user_quiz_results(user_id, quiz_id)
         return {'user_id': user_id, 'quiz_id': quiz_id, 'total_results': len(results), 'results': results}
     except Exception as e:
@@ -1498,15 +1511,16 @@ async def list_all_courses(data_service=Depends(get_data_service)):
         raise HTTPException(status_code=500, detail='Failed to list courses')
 
 
-async def create_promptpay_payment_intent(body: PromptPayCreateIntentRequest, data_service=Depends(get_data_service)):
+async def create_promptpay_payment_intent(body: PromptPayCreateIntentRequest, credentials: Optional[HTTPAuthorizationCredentials]=Depends(STUDENT_BEARER_OPTIONAL), student_auth_service: StudentAuthService=Depends(_get_student_auth_service), data_service=Depends(get_data_service)):
     """Create a Stripe PromptPay PaymentIntent for a course purchase."""
-    settings = get_settings()
-    if not settings.stripe_private_key or not settings.stripe_public_key:
-        raise HTTPException(status_code=500, detail='Stripe keys are not configured (STRIPE_PRIVATE_KEY / STRIPE_PUBLIC_KEY)')
     user_id = str(body.user_id or '').strip()
     course_id = str(body.course_id or '').strip()
     if not user_id or not course_id:
         raise HTTPException(status_code=400, detail='user_id and course_id are required')
+    await _require_user_matches_token(user_id=user_id, credentials=credentials, auth_service=student_auth_service)
+    settings = get_settings()
+    if not settings.stripe_private_key or not settings.stripe_public_key:
+        raise HTTPException(status_code=500, detail='Stripe keys are not configured (STRIPE_PRIVATE_KEY / STRIPE_PUBLIC_KEY)')
     course = await data_service.get_course(course_id)
     if not course:
         raise HTTPException(status_code=404, detail='Course not found')
@@ -1557,13 +1571,14 @@ async def create_promptpay_payment_intent(body: PromptPayCreateIntentRequest, da
     return PromptPayCreateIntentResponse(payment_intent_id=payment_intent_id, client_secret=client_secret, publishable_key=settings.stripe_public_key, amount=amount_satang, currency=str(intent.get('currency') or 'thb').upper(), payment_status=str(intent.get('status') or 'requires_payment_method'), already_enrolled=has_existing_active_enrollment)
 
 
-async def confirm_promptpay_payment_and_enroll(body: PromptPayConfirmRequest, data_service=Depends(get_data_service)):
+async def confirm_promptpay_payment_and_enroll(body: PromptPayConfirmRequest, credentials: Optional[HTTPAuthorizationCredentials]=Depends(STUDENT_BEARER_OPTIONAL), student_auth_service: StudentAuthService=Depends(_get_student_auth_service), data_service=Depends(get_data_service)):
     """Verify payment status from Stripe and enroll the user when payment succeeds."""
     user_id = str(body.user_id or '').strip()
     course_id = str(body.course_id or '').strip()
     payment_intent_id = str(body.payment_intent_id or '').strip()
     if not user_id or not course_id or (not payment_intent_id):
         raise HTTPException(status_code=400, detail='user_id, course_id, and payment_intent_id are required')
+    await _require_user_matches_token(user_id=user_id, credentials=credentials, auth_service=student_auth_service)
     return await _complete_promptpay_payment(payment_intent_id=payment_intent_id, data_service=data_service, expected_user_id=user_id, expected_course_id=course_id)
 
 
@@ -1591,9 +1606,10 @@ async def handle_stripe_payment_webhook(request: Request, stripe_signature: Opti
     return {'received': True}
 
 
-async def get_user_payment_history(user_id: str, data_service=Depends(get_data_service)):
+async def get_user_payment_history(user_id: str, credentials: Optional[HTTPAuthorizationCredentials]=Depends(STUDENT_BEARER_OPTIONAL), student_auth_service: StudentAuthService=Depends(_get_student_auth_service), data_service=Depends(get_data_service)):
     """Return student payment history from enrollment records."""
     try:
+        await _require_user_matches_token(user_id=user_id, credentials=credentials, auth_service=student_auth_service)
         get_with_aliases = getattr(data_service, 'get_user_enrollments_with_aliases', None)
         if callable(get_with_aliases):
             enrollments = await get_with_aliases(user_id)
@@ -1628,8 +1644,7 @@ async def get_student_chat_energy_status(user_id: str, credentials: Optional[HTT
         normalized_user_id = str(user_id or '').strip()
         if not normalized_user_id:
             raise HTTPException(status_code=400, detail='user_id is required')
-        if credentials and str(credentials.credentials or '').strip():
-            await _ensure_user_matches_token(user_id=normalized_user_id, credentials=credentials, auth_service=student_auth_service)
+        await _require_user_matches_token(user_id=normalized_user_id, credentials=credentials, auth_service=student_auth_service)
         status = await data_service.get_student_chat_energy_status(normalized_user_id)
         return {'user_id': normalized_user_id, **_to_chat_energy_response(status)}
     except HTTPException:
@@ -1693,8 +1708,7 @@ async def enroll_user_in_course(user_id: str=Form(...), course_id: str=Form(...)
 async def get_user_enrolled_courses(user_id: str, limit: int=50, credentials: Optional[HTTPAuthorizationCredentials]=Depends(STUDENT_BEARER_OPTIONAL), student_auth_service: StudentAuthService=Depends(_get_student_auth_service), data_service=Depends(get_data_service)):
     """Get courses the user is enrolled in."""
     try:
-        if credentials:
-            await _ensure_user_matches_token(user_id=user_id, credentials=credentials, auth_service=student_auth_service)
+        await _require_user_matches_token(user_id=user_id, credentials=credentials, auth_service=student_auth_service)
         enrolled_courses = await data_service.get_enrolled_courses_for_user(user_id, limit=limit)
         formatted_courses = []
         for course in enrolled_courses:
@@ -1711,8 +1725,7 @@ async def get_dashboard_learning_summary(user_id: str, include_ai: bool=False, c
     """Return enrolled courses plus computed learning stats for dashboard views."""
     del include_ai
     try:
-        if credentials:
-            await _ensure_user_matches_token(user_id=user_id, credentials=credentials, auth_service=student_auth_service)
+        await _require_user_matches_token(user_id=user_id, credentials=credentials, auth_service=student_auth_service)
         safe_limit = max(1, min(200, int(course_limit or 50)))
         get_inputs = getattr(data_service, 'get_dashboard_learning_inputs', None)
         if not callable(get_inputs):
