@@ -1,5 +1,6 @@
 """Logging configuration."""
 
+import os
 import sys
 
 from loguru import logger
@@ -24,8 +25,8 @@ def setup_logging():
         diagnose=True,
     )
 
-    # Add file handler for production
-    if not settings.debug:
+    # Vercel's function bundle is read-only; rely on stdout/stderr there.
+    if not settings.debug and not os.getenv("VERCEL"):
         logger.add(
             "logs/app_{time:YYYY-MM-DD}.log",
             format=settings.log_format,
