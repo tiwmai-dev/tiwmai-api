@@ -15,6 +15,8 @@ from app.models.schemas import (
     OAuthSessionRequest,
     OAuthUrlResponse,
     RegisterResponse,
+    ResendVerificationEmailRequest,
+    ResendVerificationEmailResponse,
     StudentOnboardingProfile,
     StudentOnboardingResponse,
     TokenRefreshRequest,
@@ -136,6 +138,9 @@ async def register_student(
             message=result["message"],
             user_id=result["user_id"],
             email=user_data.email,
+            email_verification_required=bool(
+                result.get("email_verification_required")
+            ),
         )
 
     except HTTPException:
@@ -145,6 +150,28 @@ async def register_student(
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Student registration failed",
+        )
+
+
+@router.post("/resend-verification-email", response_model=ResendVerificationEmailResponse)
+async def resend_student_verification_email(
+    payload: ResendVerificationEmailRequest,
+    auth_service: StudentAuthService = Depends(get_student_auth_service),
+):
+    """Resend signup verification email for an unconfirmed student account."""
+    try:
+        result = await auth_service.resend_verification_email(payload.email)
+        return ResendVerificationEmailResponse(
+            success=True,
+            message=result["message"],
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        app_logger.error(f"Student verification email resend error: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Could not resend verification email",
         )
 
 

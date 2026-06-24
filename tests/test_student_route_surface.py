@@ -18,19 +18,23 @@ def test_student_route_surface_is_registered():
     assert "/api/v1/student/chat" in paths
 
 
-def test_non_student_routes_are_not_registered():
+def test_tutor_and_admin_routes_are_registered():
     paths = _paths()
-    blocked_paths = {
-        "/metrics",
+
+    expected_paths = {
         "/api/v1/upload",
+        "/api/v1/upload-and-process",
         "/api/v1/quiz/generate",
+        "/api/v1/quiz/augment",
+        "/api/v1/users/{user_id}/quizzes",
+        "/api/v1/courses",
+        "/api/v1/courses/{course_id}",
+        "/api/v1/courses/{course_id}/lessons",
+        "/api/v1/auth/login",
+        "/api/v1/invitations/create",
         "/api/v1/admin/students",
         "/api/v1/admin/transactions",
-        "/api/v1/courses",
-        "/api/v1/auth/login",
-        "/api/v1/auth/student/login",
+        "/api/v1/admin/token-usage/daily",
     }
 
-    assert paths.isdisjoint(blocked_paths)
-    assert not any(path.startswith("/api/v1/tutor") for path in paths)
-    assert not any(path.startswith("/api/v1/admin") for path in paths)
+    assert expected_paths.issubset(paths)

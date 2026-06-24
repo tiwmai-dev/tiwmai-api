@@ -74,6 +74,9 @@ class StudentAuthService(AuthService):
         result["message"] = "Student registered successfully"
         return result
 
+    async def resend_verification_email(self, email: str) -> Dict[str, str]:
+        return await AuthService.resend_verification_email(self, email)
+
     async def authenticate_student(
         self, username: str, password: str
     ) -> Dict[str, Any]:

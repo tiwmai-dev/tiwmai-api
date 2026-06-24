@@ -73,6 +73,19 @@ def _google_user_id(google_sub: Optional[str]) -> Optional[str]:
     return f"google_{value}" if value.isdigit() else value
 
 
+DUPLICATE_USERNAME_MESSAGE = "ชื่อผู้ใช้นี้ถูกใช้แล้ว"
+DUPLICATE_EMAIL_MESSAGE = "อีเมลนี้ถูกใช้สมัครบัญชีแล้ว"
+EMAIL_NOT_VERIFIED_MESSAGE = (
+    "กรุณายืนยันอีเมลก่อนเข้าสู่ระบบ ตรวจสอบกล่องจดหมายหรือขอส่งอีเมลยืนยันอีกครั้ง"
+)
+REGISTRATION_VERIFY_EMAIL_MESSAGE = (
+    "สมัครสมาชิกสำเร็จ กรุณาตรวจสอบอีเมลเพื่อยืนยันบัญชีก่อนเข้าสู่ระบบ"
+)
+RESEND_VERIFICATION_EMAIL_MESSAGE = (
+    "หากมีบัญชีที่ยังไม่ได้ยืนยัน เราได้ส่งอีเมลยืนยันไปแล้ว กรุณาตรวจสอบกล่องจดหมาย"
+)
+
+
 def _registration_error_detail(error: Exception) -> str:
     """Return a stable client-facing message for common Supabase sign-up errors."""
     message = str(error or "").strip()
@@ -81,14 +94,31 @@ def _registration_error_detail(error: Exception) -> str:
     if any(
         token in lowered
         for token in (
+            "username",
+            "profiles_username",
+            "user_name",
+        )
+    ) and any(
+        token in lowered
+        for token in ("duplicate", "already exists", "unique", "already been registered")
+    ):
+        return DUPLICATE_USERNAME_MESSAGE
+
+    if any(
+        token in lowered
+        for token in (
             "already registered",
             "already been registered",
-            "already exists",
-            "duplicate key",
             "email_exists",
         )
     ):
-        return "อีเมลนี้ถูกใช้สมัครบัญชีแล้ว"
+        return DUPLICATE_EMAIL_MESSAGE
+
+    if "duplicate key" in lowered or "already exists" in lowered:
+        if "email" in lowered:
+            return DUPLICATE_EMAIL_MESSAGE
+        if "username" in lowered:
+            return DUPLICATE_USERNAME_MESSAGE
 
     if "invalid email" in lowered or "email address is invalid" in lowered:
         return "Email address is invalid"
@@ -99,6 +129,25 @@ def _registration_error_detail(error: Exception) -> str:
         return "Password does not meet the minimum security requirements"
 
     return "Registration failed"
+
+
+def _login_error_detail(error: Exception) -> str:
+    """Return a stable client-facing message for common Supabase login errors."""
+    message = str(error or "").strip()
+    lowered = message.lower()
+
+    if any(
+        token in lowered
+        for token in (
+            "email not confirmed",
+            "email_not_confirmed",
+            "not confirmed",
+            "confirm your email",
+        )
+    ):
+        return EMAIL_NOT_VERIFIED_MESSAGE
+
+    return "Invalid username or password"
 
 
 class AuthService:
@@ -280,6 +329,83 @@ class AuthService:
         except Exception as e:
             app_logger.warning(f"Unable to load legacy profile for {alias}: {e}")
             return {}
+
+    async def _username_is_taken(self, username: str) -> bool:
+        value = str(username or "").strip()
+        if not value:
+            return False
+        try:
+            result = await self.supabase.run(
+                lambda: self.client.table("profiles")
+                .select("user_id")
+                .ilike("username", value)
+                .limit(1)
+                .execute()
+            )
+            rows = getattr(result, "data", None) or []
+            return bool(rows)
+        except Exception as e:
+            app_logger.warning(f"Username availability check failed for {value}: {e}")
+            return False
+
+    def _email_verification_redirect_url(self) -> str:
+        configured = str(self.settings.student_web_app_url or "").strip().rstrip("/")
+        if configured:
+            return f"{configured}/auth/callback"
+        oauth_redirect = str(self.settings.supabase_oauth_redirect_uri or "").strip()
+        if oauth_redirect:
+            return oauth_redirect
+        if self.settings.allowed_origins_list:
+            return f"{self.settings.allowed_origins_list[0].rstrip('/')}/auth/callback"
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Email verification redirect URL is not configured",
+        )
+
+    async def _send_verification_email(self, email: str) -> None:
+        normalized_email = str(email or "").strip()
+        if not normalized_email:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Email address is required",
+            )
+        redirect_to = self._email_verification_redirect_url()
+        try:
+            await self.supabase.run(
+                self.anon_client.auth.resend,
+                {
+                    "type": "signup",
+                    "email": normalized_email,
+                    "options": {"email_redirect_to": redirect_to},
+                },
+            )
+        except Exception as e:
+            app_logger.error(
+                "Failed to send verification email to %s: %s", normalized_email, e
+            )
+            raise HTTPException(
+                status_code=status.HTTP_502_BAD_GATEWAY,
+                detail="ไม่สามารถส่งอีเมลยืนยันได้ กรุณาลองใหม่อีกครั้ง",
+            )
+
+    async def resend_verification_email(self, email: str) -> Dict[str, str]:
+        normalized_email = str(email or "").strip()
+        if not normalized_email or "@" not in normalized_email:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Email address is invalid",
+            )
+        try:
+            await self._send_verification_email(normalized_email)
+        except HTTPException as exc:
+            if exc.status_code == status.HTTP_502_BAD_GATEWAY:
+                raise
+            app_logger.warning(
+                "Verification email resend skipped for %s: %s",
+                normalized_email,
+                exc.detail,
+            )
+        return {"message": RESEND_VERIFICATION_EMAIL_MESSAGE}
 
     async def _upsert_profile(
         self,
@@ -585,9 +711,21 @@ class AuthService:
         given_name: Optional[str] = None,
         family_name: Optional[str] = None,
     ) -> Dict[str, Any]:
+        normalized_username = str(username or "").strip()
+        normalized_email = str(email or "").strip()
+        if not normalized_username:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Username is required",
+            )
+        if await self._username_is_taken(normalized_username):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=DUPLICATE_USERNAME_MESSAGE,
+            )
         try:
             metadata = {
-                "username": username,
+                "username": normalized_username,
                 "given_name": given_name,
                 "family_name": family_name,
                 "role": self.role,
@@ -595,9 +733,9 @@ class AuthService:
             response = await self.supabase.run(
                 self.client.auth.admin.create_user,
                 {
-                    "email": email,
+                    "email": normalized_email,
                     "password": password,
-                    "email_confirm": True,
+                    "email_confirm": False,
                     "user_metadata": metadata,
                     "app_metadata": {"role": self.role},
                 },
@@ -609,13 +747,22 @@ class AuthService:
             if not user_id:
                 raise ValueError("Supabase did not return a user id")
             await self._upsert_profile(
-                user_id, email, username, self.role, given_name, family_name
+                user_id,
+                normalized_email,
+                normalized_username,
+                self.role,
+                given_name,
+                family_name,
             )
+            await self._send_verification_email(normalized_email)
             return {
                 "user_id": user_id,
-                "email": email,
-                "message": "User registered successfully",
+                "email": normalized_email,
+                "message": REGISTRATION_VERIFY_EMAIL_MESSAGE,
+                "email_verification_required": True,
             }
+        except HTTPException:
+            raise
         except Exception as e:
             app_logger.error(f"Supabase registration error: {e}")
             raise HTTPException(
@@ -646,13 +793,19 @@ class AuthService:
                     metadata.get("given_name"),
                     metadata.get("family_name"),
                 )
+            user_info = self._to_user_info(user, profile)
+            if not user_info.email_verified:
+                raise HTTPException(
+                    status_code=status.HTTP_401_UNAUTHORIZED,
+                    detail=EMAIL_NOT_VERIFIED_MESSAGE,
+                )
             return {
                 "access_token": session.get("access_token"),
                 "refresh_token": session.get("refresh_token"),
                 "id_token": session.get("access_token"),
                 "token_type": "Bearer",
                 "expires_in": int(session.get("expires_in") or 3600),
-                "user": self._to_user_info(user, profile).model_dump(),
+                "user": user_info.model_dump(),
             }
         except HTTPException:
             raise
@@ -660,7 +813,7 @@ class AuthService:
             app_logger.error(f"Supabase login error: {e}")
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="Invalid username or password",
+                detail=_login_error_detail(e),
             )
 
     async def get_user_info(self, access_token: str) -> UserInfo:

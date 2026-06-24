@@ -1,4 +1,10 @@
-"""Supabase-backed data service for student API persistence."""
+"""Supabase-backed data service with the legacy DynamoDBService API.
+
+The rest of the application still imports ``get_db_service`` and, in a few
+older endpoints, reaches for ``users_table.scan()``. This module keeps those
+compatibility surfaces while routing all runtime persistence to Supabase
+Postgres.
+"""
 
 import asyncio
 import hashlib
@@ -123,44 +129,6 @@ QUIZ_RESULT_SUMMARY_SELECT = ",".join(
         "correct_count:data->correct_count",
         "time_spent_seconds:data->time_spent_seconds",
         "lesson_id:data->>lesson_id",
-    )
-)
-
-ENROLLMENT_SUMMARY_SELECT = ",".join(
-    (
-        "enrollment_id",
-        "user_id",
-        "course_id",
-        "status",
-        "enrolled_at",
-        "expires_at",
-        "created_at",
-        "updated_at",
-        "started_at:data->>started_at",
-        "duration_months:data->duration_months",
-        "enrollment_source:data->>enrollment_source",
-        "enrollment_type:data->>enrollment_type",
-        "payment_provider:data->>payment_provider",
-        "payment_type:data->>payment_type",
-        "payment_intent_id:data->>payment_intent_id",
-        "payment_status:data->>payment_status",
-        "paid_amount_thb:data->paid_amount_thb",
-        "paid_currency:data->>paid_currency",
-        "billing_email:data->>billing_email",
-        "plan_label:data->>plan_label",
-        "paid_at:data->>paid_at",
-        "payment_history:data->payment_history",
-        "trial_consumed_at:data->>trial_consumed_at",
-        "trial_expires_at:data->>trial_expires_at",
-        "progress:data->progress",
-        "completed_quizzes:data->completed_quizzes",
-        "total_quizzes:data->total_quizzes",
-        "completed_questions:data->completed_questions",
-        "total_questions:data->total_questions",
-        "last_activity:data->>last_activity",
-        "learning_activity_days:data->learning_activity_days",
-        "last_learning_activity_at:data->>last_learning_activity_at",
-        "last_lesson_id:data->>last_lesson_id",
     )
 )
 
@@ -293,7 +261,7 @@ def _utcnow() -> str:
 
 
 class SupabaseTableAdapter:
-    """Small table shim for legacy scan/put_item call sites."""
+    """Small DynamoDB table compatibility shim used by older endpoints."""
 
     def __init__(self, service: "SupabaseDataService", table_name: str):
         self.service = service
@@ -352,7 +320,7 @@ class SupabaseTableAdapter:
 
 
 class SupabaseDataService:
-    """Data service backed by Supabase Postgres."""
+    """Data service that mirrors the old DynamoDB method names."""
 
     def __init__(self) -> None:
         self.settings = get_settings()
@@ -513,19 +481,20 @@ class SupabaseDataService:
 
         matched_user_ids: List[str] = []
         max_candidates = max(1, min(len(candidate_user_ids), limit * 3))
-        enrollments_by_user = await self._get_user_enrollments_by_user_ids(
-            candidate_user_ids[:max_candidates],
-            limit_per_user=limit,
-        )
-        for candidate_user_id, rows in enrollments_by_user.items():
-            if not rows:
-                continue
-            user_id = self._normalize_identity(candidate_user_id)
-            if not user_id or user_id in matched_user_ids:
-                continue
-            matched_user_ids.append(user_id)
-            if len(matched_user_ids) >= limit:
-                return matched_user_ids
+        for candidate_user_id in candidate_user_ids[:max_candidates]:
+            rows = await self._filter(
+                "enrollments",
+                ("user_id", candidate_user_id),
+                include_deleted=False,
+                limit=limit,
+            )
+            for row in rows:
+                user_id = self._normalize_identity(row.get("user_id"))
+                if not user_id or user_id in matched_user_ids:
+                    continue
+                matched_user_ids.append(user_id)
+                if len(matched_user_ids) >= limit:
+                    return matched_user_ids
 
         return matched_user_ids
 
@@ -1114,32 +1083,31 @@ class SupabaseDataService:
 
         rows: List[Dict[str, Any]] = []
         seen_course_ids = set()
-        select_expr = COURSE_SUMMARY_SELECT if summary else "*"
-        owner_rows, instructor_rows = await asyncio.gather(
-            self._filter_in(
-                "courses",
-                "user_id",
-                lookup_ids,
-                limit=1000,
-                include_deleted=False,
-                select=select_expr,
-            ),
-            self._filter_in(
-                "courses",
-                "instructor_id",
-                lookup_ids,
-                limit=1000,
-                include_deleted=False,
-                select=select_expr,
-            ),
-        )
-        for row in owner_rows + instructor_rows:
-            course_id = row.get("course_id")
-            if course_id and course_id in seen_course_ids:
-                continue
-            if course_id:
-                seen_course_ids.add(course_id)
-            rows.append(row)
+        for lookup_id in lookup_ids:
+            for column in ("user_id", "instructor_id"):
+                if summary:
+                    matched_rows = (
+                        await self._query(
+                            "courses",
+                            select=COURSE_SUMMARY_SELECT,
+                            eq={column: lookup_id},
+                            neq={"status": "deleted"},
+                            order_by="created_at",
+                            desc=True,
+                            limit=1000,
+                        )
+                    )["rows"]
+                else:
+                    matched_rows = await self._filter(
+                        "courses", (column, lookup_id), include_deleted=False
+                    )
+                for row in matched_rows:
+                    course_id = row.get("course_id")
+                    if course_id and course_id in seen_course_ids:
+                        continue
+                    if course_id:
+                        seen_course_ids.add(course_id)
+                    rows.append(row)
 
         return self._cache_set(
             cache_key,
@@ -1635,49 +1603,6 @@ class SupabaseDataService:
             reverse=True,
         )
 
-    async def _get_user_enrollments_by_user_ids(
-        self, user_ids: List[str], *, limit_per_user: int = 50
-    ) -> Dict[str, List[Dict[str, Any]]]:
-        normalized_user_ids: List[str] = []
-        for user_id in user_ids:
-            self._append_unique_identity(normalized_user_ids, user_id)
-        if not normalized_user_ids:
-            return {}
-
-        if not hasattr(self, "supabase"):
-            serial_rows = await asyncio.gather(
-                *[
-                    self.get_user_enrollments(user_id, limit=limit_per_user)
-                    for user_id in normalized_user_ids
-                ]
-            )
-            return {
-                user_id: rows
-                for user_id, rows in zip(normalized_user_ids, serial_rows)
-            }
-
-        max_rows = max(limit_per_user, len(normalized_user_ids) * limit_per_user)
-        result = await self._query(
-            "enrollments",
-            select=ENROLLMENT_SUMMARY_SELECT,
-            in_filters={"user_id": normalized_user_ids},
-            neq={"status": "deleted"},
-            order_by="enrolled_at",
-            desc=True,
-            limit=max_rows,
-        )
-        rows_by_user_id: Dict[str, List[Dict[str, Any]]] = {
-            user_id: [] for user_id in normalized_user_ids
-        }
-        for row in result["rows"]:
-            user_id = self._normalize_identity(row.get("user_id"))
-            if user_id not in rows_by_user_id:
-                continue
-            if len(rows_by_user_id[user_id]) >= limit_per_user:
-                continue
-            rows_by_user_id[user_id].append(row)
-        return rows_by_user_id
-
     async def _get_user_identity_candidates(
         self, user_id: str, *, include_email_alias: bool = True
     ) -> List[str]:
@@ -1709,12 +1634,11 @@ class SupabaseDataService:
             candidate_id: idx for idx, candidate_id in enumerate(candidate_ids)
         }
         preferred_enrollments: Dict[str, Dict[str, Any]] = {}
-        enrollments_by_user_id = await self._get_user_enrollments_by_user_ids(
-            candidate_ids, limit_per_user=limit
-        )
 
         for candidate_user_id in candidate_ids:
-            enrollments = enrollments_by_user_id.get(candidate_user_id, [])
+            enrollments = await self.get_user_enrollments(
+                candidate_user_id, limit=limit
+            )
             for enrollment in enrollments:
                 status = str(enrollment.get("status", "")).lower()
                 if status not in {"active", "trial", "paid"}:
@@ -1781,12 +1705,11 @@ class SupabaseDataService:
         candidate_ids = await self._get_user_identity_candidates(user_id)
         rows: List[Dict[str, Any]] = []
         seen_enrollment_ids = set()
-        enrollments_by_user_id = await self._get_user_enrollments_by_user_ids(
-            candidate_ids, limit_per_user=limit
-        )
 
         for candidate_user_id in candidate_ids:
-            enrollments = enrollments_by_user_id.get(candidate_user_id, [])
+            enrollments = await self.get_user_enrollments(
+                candidate_user_id, limit=limit
+            )
             for enrollment in enrollments:
                 enrollment_id = self._normalize_identity(
                     enrollment.get("enrollment_id")
@@ -2115,34 +2038,6 @@ class SupabaseDataService:
             },
         )
 
-    async def get_user_enrollment_for_course(
-        self, user_id: str, course_id: str
-    ) -> Optional[Dict[str, Any]]:
-        normalized_course_id = self._normalize_identity(course_id)
-        if not normalized_course_id:
-            return None
-
-        candidate_ids, preferred_enrollments = (
-            await self._resolve_enrollment_identity_candidates(user_id, limit=50)
-        )
-        if not candidate_ids:
-            return None
-
-        enrollment = preferred_enrollments.get(normalized_course_id)
-        if enrollment:
-            return enrollment
-
-        rows = (
-            await self._query(
-                "enrollments",
-                in_filters={"user_id": candidate_ids},
-                eq={"course_id": normalized_course_id},
-                neq={"status": "deleted"},
-                limit=1,
-            )
-        )["rows"]
-        return rows[0] if rows else None
-
     async def get_course_learning_overview(
         self, course_id: str, user_id: Optional[str] = None
     ) -> Dict[str, Any]:
@@ -2169,22 +2064,37 @@ class SupabaseDataService:
                 course_id=normalized_course_id,
                 summary=True,
             )
-            enrollment_task = self.get_user_enrollment_for_course(
-                normalized_user_id, normalized_course_id
+            enrollments_task = self.get_enrolled_courses_for_user(
+                normalized_user_id, limit=200
             )
         else:
             results_task = asyncio.sleep(0, result=[])
-            enrollment_task = asyncio.sleep(0, result=None)
+            enrollments_task = asyncio.sleep(0, result=[])
 
-        course_payload, lessons, quizzes, quiz_results, enrollment_row = (
+        course_payload, lessons, quizzes, quiz_results, enrolled_courses = (
             await asyncio.gather(
-                course_task, lessons_task, quizzes_task, results_task, enrollment_task
+                course_task, lessons_task, quizzes_task, results_task, enrollments_task
             )
         )
         course = (course_payload.get("rows") or [None])[0]
         enrollment = None
-        if enrollment_row:
-            enrollment = enrollment_row
+        for row in enrolled_courses or []:
+            if self._normalize_identity(row.get("course_id")) == normalized_course_id:
+                enrollment = row.get("enrollment") or {
+                    key: row.get(key)
+                    for key in (
+                        "enrollment_id",
+                        "enrollment_status",
+                        "enrolled_at",
+                        "started_at",
+                        "expires_at",
+                        "duration_months",
+                        "progress",
+                        "last_activity",
+                    )
+                    if row.get(key) is not None
+                }
+                break
 
         return self._cache_set(
             cache_key,
@@ -2265,54 +2175,39 @@ class SupabaseDataService:
             course_quiz_ids.discard("")
 
         async def collect_rows(candidate_ids: List[str]) -> None:
-            normalized_candidate_ids: List[str] = []
             for candidate_user_id in candidate_ids:
-                self._append_unique_identity(
-                    normalized_candidate_ids, candidate_user_id
-                )
-            if not normalized_candidate_ids:
-                return
-
-            if hasattr(self, "supabase"):
-                eq = {}
-                in_filters: Dict[str, List[Any]] = {
-                    "user_id": normalized_candidate_ids
-                }
-                if quiz_id:
-                    eq["quiz_id"] = quiz_id
-                elif normalized_course_id and course_quiz_ids:
-                    in_filters["quiz_id"] = list(course_quiz_ids)
-                query_limit = max(limit, len(normalized_candidate_ids) * limit)
-                candidate_rows = (
-                    await self._query(
-                        "quiz_results",
-                        select=QUIZ_RESULT_SUMMARY_SELECT if summary else "*",
-                        eq=eq,
-                        in_filters=in_filters,
-                        order_by="submitted_at",
-                        desc=True,
-                        limit=query_limit,
-                    )
-                )["rows"]
-            else:
-                serial_rows = []
-                for candidate_user_id in normalized_candidate_ids:
+                if hasattr(self, "supabase"):
+                    eq = {"user_id": candidate_user_id}
+                    in_filters = None
+                    if quiz_id:
+                        eq["quiz_id"] = quiz_id
+                    elif normalized_course_id and course_quiz_ids:
+                        in_filters = {"quiz_id": list(course_quiz_ids)}
+                    candidate_rows = (
+                        await self._query(
+                            "quiz_results",
+                            select=QUIZ_RESULT_SUMMARY_SELECT if summary else "*",
+                            eq=eq,
+                            in_filters=in_filters,
+                            order_by="submitted_at",
+                            desc=True,
+                            limit=limit,
+                        )
+                    )["rows"]
+                else:
                     candidate_rows = await self._filter(
                         "quiz_results",
                         ("user_id", candidate_user_id),
                         include_deleted=True,
                         limit=limit,
                     )
-                    serial_rows.extend(candidate_rows)
-                candidate_rows = serial_rows
-
-            for row in candidate_rows:
-                result_id = self._normalize_identity(row.get("result_id"))
-                if result_id and result_id in seen_result_ids:
-                    continue
-                if result_id:
-                    seen_result_ids.add(result_id)
-                rows.append(row)
+                for row in candidate_rows:
+                    result_id = self._normalize_identity(row.get("result_id"))
+                    if result_id and result_id in seen_result_ids:
+                        continue
+                    if result_id:
+                        seen_result_ids.add(result_id)
+                    rows.append(row)
 
         await collect_rows(primary_candidate_ids)
         if not rows:
@@ -2600,7 +2495,7 @@ class SupabaseDataService:
         if not used_thb:
             used_usd = self._safe_float(usage.get("llm_cost_usd"), 0.0)
             used_thb = used_usd * self._safe_float(
-                self.settings.openrouter_cost_usd_to_thb,
+                self.settings.litellm_cost_usd_to_thb,
                 36.0,
             )
         default_limit = self._safe_float(
@@ -2660,8 +2555,8 @@ class SupabaseDataService:
         return await self.check_tables_health()
 
 
-class DataService:
-    """Facade for Supabase-backed student data access."""
+class DynamoDBService:
+    """Compatibility facade preserving the old class name."""
 
     def __init__(self) -> None:
         self.service = SupabaseDataService()
@@ -2670,11 +2565,11 @@ class DataService:
         return getattr(self.service, name)
 
 
-_db_service: Optional[DataService] = None
+_db_service: Optional[DynamoDBService] = None
 
 
-def get_db_service() -> DataService:
+def get_db_service() -> DynamoDBService:
     global _db_service
     if _db_service is None:
-        _db_service = DataService()
+        _db_service = DynamoDBService()
     return _db_service

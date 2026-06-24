@@ -131,15 +131,9 @@ def test_apply_usage_to_energy_status_avoids_refresh_query():
 
 
 @pytest.mark.unit
-def test_usage_cost_falls_back_to_token_pricing_when_openrouter_omits_cost():
+def test_usage_cost_is_zero_when_openrouter_omits_cost():
     service = ChatService()
-    service.settings.openrouter_chat_input_cost_per_token_usd = 0.00000025
-    service.settings.openrouter_chat_output_cost_per_token_usd = 0.0000015
 
-    cost = service._resolve_usage_cost_usd(
-        response_cost_usd=0.0,
-        input_tokens=4784,
-        output_tokens=2743,
-    )
+    cost = service._extract_openrouter_response_cost_usd(None)
 
-    assert cost == pytest.approx(0.0053105)
+    assert cost == 0.0

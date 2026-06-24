@@ -1,6 +1,7 @@
 """Pydantic models for request/response schemas."""
 
 from datetime import datetime, timezone
+from enum import Enum
 from typing import Any, Dict, List, Literal, Optional
 
 from pydantic import BaseModel, ConfigDict, Field, field_serializer, field_validator
@@ -13,6 +14,240 @@ def serialize_utc_timestamp(value: datetime) -> str:
     else:
         value = value.astimezone(timezone.utc)
     return value.isoformat().replace("+00:00", "Z")
+
+
+class DocumentTypeEnum(str, Enum):
+    """Document type enumeration."""
+
+    DOCUMENT = "document"
+    BOOK = "book"
+    EXAM = "exam"
+
+
+class ProcessingStatusEnum(str, Enum):
+    """Processing status enumeration."""
+
+    PENDING = "pending"
+    PROCESSING = "processing"
+    COMPLETED = "completed"
+    ERROR = "error"
+
+
+class OCRRequest(BaseModel):
+    """OCR processing request."""
+
+    model_config = ConfigDict(str_strip_whitespace=True)
+
+    document_type: DocumentTypeEnum = Field(
+        default=DocumentTypeEnum.DOCUMENT, description="Type of document to process"
+    )
+    language: str = Field(
+        default="th",
+        description="Primary language of the document",
+        min_length=2,
+        max_length=5,
+    )
+    enhance_markdown: bool = Field(
+        default=True,
+        description="Whether to enhance the output with markdown formatting",
+    )
+    course_id: Optional[str] = Field(
+        default=None, description="Course ID to associate this document with"
+    )
+
+
+class QuestionChoice(BaseModel):
+    """Question and choice data structure."""
+
+    question: str = Field(description="The question text")
+    context: Optional[str] = Field(
+        default=None,
+        description="Shared instructions, passage, or supporting context needed to answer the question",
+    )
+    choices: List[str] = Field(description="List of answer choices")
+    correct_answer: Optional[int] = Field(
+        default=None, description="Correct answer index if available"
+    )
+    explanation: Optional[str] = Field(
+        default=None, description="Answer explanation if available"
+    )
+    difficulty: Optional[int] = Field(
+        default=None, description="Difficulty score if available"
+    )
+    topic_tag: Optional[str] = Field(default=None, description="Topic tag if available")
+    subject_tag: Optional[str] = Field(
+        default=None, description="Subject tag if available"
+    )
+    image_url: Optional[str] = Field(
+        default=None, description="Question image URL if available"
+    )
+
+
+class DocumentContent(BaseModel):
+    """Document content structure for JSON storage."""
+
+    document_type: str = Field(description="Type of document (document, book, exam)")
+    title: Optional[str] = Field(default=None, description="Document title")
+    content: Dict[str, Any] = Field(description="Document content in structured format")
+    questions: Optional[List[QuestionChoice]] = Field(
+        default=None, description="Extracted questions for exams"
+    )
+    metadata: Optional[Dict[str, Any]] = Field(
+        default=None, description="Additional content metadata"
+    )
+
+
+class OCRResponse(BaseModel):
+    """OCR processing response."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    document_id: str = Field(description="Unique document identifier")
+    status: ProcessingStatusEnum = Field(description="Processing status")
+    original_text: Optional[str] = Field(default=None, description="Raw extracted text")
+    structured_content: Optional[DocumentContent] = Field(
+        default=None, description="Structured document content as JSON"
+    )
+    questions_data: Optional[List[QuestionChoice]] = Field(
+        default=None, description="Extracted questions and choices"
+    )
+    confidence_score: Optional[float] = Field(
+        default=None, description="OCR confidence score (0-1)", ge=0.0, le=1.0
+    )
+    processing_time_ms: Optional[int] = Field(
+        default=None, description="Processing time in milliseconds", ge=0
+    )
+    error_message: Optional[str] = Field(
+        default=None, description="Error message if failed"
+    )
+    metadata: Optional[Dict[str, Any]] = Field(
+        default=None, description="Additional metadata"
+    )
+
+
+class QuizAugmentRequest(BaseModel):
+    """Quiz augmentation request."""
+
+    questions: List[Dict[str, Any]] = Field(
+        default_factory=list, description="Questions to augment"
+    )
+    language: str = Field(default="th", description="Language hint for augmentation")
+    num_questions: Optional[int] = Field(
+        default=None, description="Number of questions to return"
+    )
+    num_sets: Optional[int] = Field(
+        default=None, description="Number of question sets to return"
+    )
+    classify_topic_tag: bool = Field(
+        default=False,
+        description="Whether to classify and return topic_tag for each question",
+    )
+    course_topics: Optional[List[str]] = Field(
+        default=None, description="Allowed topic_tag values for classification"
+    )
+    mode: Literal["transform", "solve", "image_filter", "deconstruct"] = Field(
+        default="transform",
+        description="transform=create variants, solve=keep original question and infer correct_answer/explanation, image_filter=classify whether each question requires an image/diagram, deconstruct=extract copyright-safe academic skeleton",
+    )
+
+
+class QuizAugmentResponse(BaseModel):
+    """Quiz augmentation response."""
+
+    questions: List[Dict[str, Any]] = Field(
+        default_factory=list, description="Augmented questions"
+    )
+    sets: Optional[List[Dict[str, Any]]] = Field(
+        default=None, description="Augmented question sets"
+    )
+    model: Optional[str] = Field(
+        default=None, description="Model used for augmentation"
+    )
+
+
+class CourseAIGenerateRequest(BaseModel):
+    """Course detail AI generation request."""
+
+    prompt: str = Field(
+        min_length=1, max_length=1200, description="Prompt for course details"
+    )
+    name: Optional[str] = Field(default=None, description="Course name")
+    category: Optional[str] = Field(default=None, description="Course category")
+    topics: List[str] = Field(
+        default_factory=list, description="Course topic names for context"
+    )
+    content_items: List[Dict[str, str]] = Field(
+        default_factory=list,
+        description="Course content items to generate descriptions for",
+    )
+
+
+class CourseAIGenerateResponse(BaseModel):
+    """Course detail AI generation response."""
+
+    description: str = Field(default="", description="Generated course description")
+    target_profile: str = Field(
+        default="", description="Generated target profile summary"
+    )
+    structure_summary: str = Field(
+        default="", description="Generated structure summary"
+    )
+    content_items: List[Dict[str, str]] = Field(
+        default_factory=list, description="Generated course content item descriptions"
+    )
+
+
+class DocumentInfo(BaseModel):
+    """Document information."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    document_id: str = Field(description="Unique document identifier")
+    filename: str = Field(description="Original filename")
+    file_size: int = Field(description="File size in bytes", gt=0)
+    mime_type: str = Field(description="MIME type of the file")
+    document_type: DocumentTypeEnum = Field(description="Type of document")
+    upload_timestamp: datetime = Field(description="Upload timestamp")
+    status: ProcessingStatusEnum = Field(description="Processing status")
+    course_id: Optional[str] = Field(
+        default=None, description="Course ID associated with this document"
+    )
+
+
+class ProcessingJob(BaseModel):
+    """Processing job information."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    job_id: str = Field(description="Unique job identifier")
+    document_id: str = Field(description="Associated document identifier")
+    status: ProcessingStatusEnum = Field(description="Current job status")
+    created_at: datetime = Field(description="Job creation timestamp")
+    started_at: Optional[datetime] = Field(
+        default=None, description="Job start timestamp"
+    )
+    completed_at: Optional[datetime] = Field(
+        default=None, description="Job completion timestamp"
+    )
+    progress_percentage: int = Field(
+        default=0, description="Progress percentage", ge=0, le=100
+    )
+    result: Optional[OCRResponse] = Field(
+        default=None, description="Job result if completed"
+    )
+
+
+class UploadResponse(BaseModel):
+    """File upload response."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    document_id: str = Field(description="Unique document identifier")
+    filename: str = Field(description="Uploaded filename")
+    file_size: int = Field(description="File size in bytes")
+    mime_type: str = Field(description="MIME type")
+    upload_url: str = Field(description="URL to access the uploaded file")
+    message: str = Field(description="Success message")
 
 
 class ErrorResponse(BaseModel):
@@ -45,12 +280,22 @@ class HealthCheckResponse(BaseModel):
     timestamp: datetime = Field(default_factory=datetime.utcnow)
     version: str = Field(description="API version")
     uptime_seconds: float = Field(description="Service uptime in seconds")
-    llm_status: str = Field(description="LLM provider status")
+    gemini_status: str = Field(description="Gemini API status")
 
     @field_serializer("timestamp")
     def serialize_timestamp(self, v: datetime) -> str:
         """Serialize datetime to ISO format string."""
         return v.isoformat()
+
+
+class DocumentListResponse(BaseModel):
+    """Document list response."""
+
+    documents: List[DocumentInfo] = Field(description="List of documents")
+    total_count: int = Field(description="Total number of documents", ge=0)
+    page: int = Field(default=1, description="Current page number", ge=1)
+    page_size: int = Field(default=20, description="Items per page", ge=1, le=100)
+    total_pages: int = Field(description="Total number of pages", ge=0)
 
 
 # Authentication Models
@@ -215,6 +460,24 @@ class RegisterResponse(BaseModel):
     user_id: str = Field(description="User ID")
     email: str = Field(description="Email address")
     message: str = Field(description="Registration message")
+    email_verification_required: bool = Field(
+        default=False, description="Whether the user must verify email before login"
+    )
+
+
+class ResendVerificationEmailRequest(BaseModel):
+    """Request to resend a signup verification email."""
+
+    model_config = ConfigDict(str_strip_whitespace=True)
+
+    email: str = Field(description="Email address used during registration")
+
+
+class ResendVerificationEmailResponse(BaseModel):
+    """Response after requesting a verification email resend."""
+
+    success: bool = Field(default=True, description="Request accepted")
+    message: str = Field(description="User-facing status message")
 
 
 class LogoutResponse(BaseModel):
@@ -324,6 +587,74 @@ class ConversationHistory(BaseModel):
     updated_at: datetime = Field(description="Last update timestamp")
 
 
+# Invitation Models
+
+
+class InvitationStatusEnum(str, Enum):
+    """Invitation status enumeration."""
+
+    PENDING = "pending"
+    ACCEPTED = "accepted"
+    DECLINED = "declined"
+    EXPIRED = "expired"
+
+
+class CreateInvitationRequest(BaseModel):
+    """Create course invitation request."""
+
+    model_config = ConfigDict(str_strip_whitespace=True)
+
+    student_id: str = Field(description="Student ID to invite")
+    course_id: str = Field(description="Course ID")
+    message: Optional[str] = Field(
+        default=None, description="Optional invitation message"
+    )
+
+
+class CourseInvitation(BaseModel):
+    """Course invitation model."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    id: str = Field(description="Invitation ID")
+    course_id: str = Field(description="Course ID")
+    course_name: str = Field(description="Course name")
+    instructor_id: str = Field(description="Instructor ID")
+    instructor_name: str = Field(description="Instructor name")
+    student_id: str = Field(description="Student ID")
+    student_email: Optional[str] = Field(default=None, description="Student email")
+    status: InvitationStatusEnum = Field(description="Invitation status")
+    message: Optional[str] = Field(default=None, description="Invitation message")
+    created_at: datetime = Field(description="Creation timestamp")
+    expires_at: datetime = Field(description="Expiration timestamp")
+
+    @field_serializer("created_at", "expires_at")
+    def serialize_datetime(self, v: datetime) -> str:
+        """Serialize datetime to ISO format string."""
+        return v.isoformat()
+
+
+class InvitationResponse(BaseModel):
+    """Invitation response."""
+
+    success: bool = Field(description="Operation success status")
+    message: str = Field(description="Response message")
+    invitation_id: Optional[str] = Field(default=None, description="Invitation ID")
+
+
+class AcceptInvitationRequest(BaseModel):
+    """Accept invitation request."""
+
+    invitation_id: str = Field(description="Invitation ID to accept")
+
+
+class InvitationListResponse(BaseModel):
+    """List of invitations response."""
+
+    invitations: List[CourseInvitation] = Field(description="List of invitations")
+    total: int = Field(description="Total number of invitations")
+
+
 # Lesson-related models
 class LessonDocument(BaseModel):
     """Lesson document reference."""
@@ -343,6 +674,41 @@ class LessonQuiz(BaseModel):
     id: str = Field(description="Quiz ID")
     title: Optional[str] = Field(default=None, description="Quiz title")
     questions: Optional[int] = Field(default=None, description="Number of questions")
+
+
+class CreateLessonRequest(BaseModel):
+    """Create lesson request."""
+
+    model_config = ConfigDict(str_strip_whitespace=True)
+
+    title: str = Field(description="Lesson title")
+    description: Optional[str] = Field(default="", description="Lesson description")
+    order: int = Field(default=1, description="Lesson order in course")
+    selectedDocuments: List[LessonDocument] = Field(
+        default=[], description="Selected documents for lesson"
+    )
+    selectedQuizzes: List[LessonQuiz] = Field(
+        default=[], description="Selected quizzes for lesson"
+    )
+
+
+class UpdateLessonRequest(BaseModel):
+    """Update lesson request."""
+
+    model_config = ConfigDict(str_strip_whitespace=True)
+
+    title: Optional[str] = Field(default=None, description="Lesson title")
+    description: Optional[str] = Field(default=None, description="Lesson description")
+    order: Optional[int] = Field(default=None, description="Lesson order in course")
+    selectedDocuments: Optional[List[LessonDocument]] = Field(
+        default=None, description="Selected documents for lesson"
+    )
+    selectedQuizzes: Optional[List[LessonQuiz]] = Field(
+        default=None, description="Selected quizzes for lesson"
+    )
+    isPublished: Optional[bool] = Field(
+        default=None, description="Lesson publish status"
+    )
 
 
 class Lesson(BaseModel):

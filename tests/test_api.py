@@ -28,7 +28,7 @@ def test_health_check():
 
 
 def test_upload_pdf_file():
-    """OCR upload is intentionally not exposed by the student-only API."""
+    """OCR upload is exposed for the migrated tutor API."""
     # Create a simple PDF-like file for testing
     pdf_content = b"%PDF-1.4\n1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n"
 
@@ -42,14 +42,14 @@ def test_upload_pdf_file():
 
             response = client.post("/api/v1/upload", files=files, data=data)
 
-            assert response.status_code == 404
+            assert response.status_code == 200
 
         # Cleanup
         Path(f.name).unlink(missing_ok=True)
 
 
 def test_upload_invalid_file():
-    """OCR upload is intentionally not exposed by the student-only API."""
+    """OCR upload validates unsupported file types."""
     # Create a text file
     with tempfile.NamedTemporaryFile(suffix=".txt", mode="w") as f:
         f.write("This is a text file")
@@ -61,11 +61,11 @@ def test_upload_invalid_file():
 
             response = client.post("/api/v1/upload", files=files, data=data)
 
-            assert response.status_code == 404
+            assert response.status_code == 400
 
 
 def test_upload_large_file():
-    """OCR upload is intentionally not exposed by the student-only API."""
+    """OCR upload accepts valid image files under the configured limit."""
     # Create a large image (this would need to be larger than MAX_FILE_SIZE in real test)
     img = Image.new("RGB", (5000, 5000), color="white")
     with tempfile.NamedTemporaryFile(suffix=".png") as f:
@@ -79,12 +79,12 @@ def test_upload_large_file():
 
         response = client.post("/api/v1/upload", files=files, data=data)
 
-        assert response.status_code == 404
+        assert response.status_code == 200
 
 
 @pytest.mark.asyncio
 async def test_process_document_without_typhoon_ocr_key():
-    """OCR processing is intentionally not exposed by the student-only API."""
+    """OCR processing route is exposed and returns a structured processing response."""
 
     pdf_content = b"%PDF-1.4\n1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n"
 
@@ -102,7 +102,7 @@ async def test_process_document_without_typhoon_ocr_key():
 
             response = client.post("/api/v1/upload-and-process", files=files, data=data)
 
-            assert response.status_code == 404
+            assert response.status_code == 200
 
         # Cleanup
         Path(f.name).unlink(missing_ok=True)

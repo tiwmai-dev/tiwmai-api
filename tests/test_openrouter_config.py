@@ -10,7 +10,8 @@ def test_openrouter_defaults_are_openai_compatible():
 
     assert settings.openrouter_base_url == "https://openrouter.ai/api/v1"
     assert hasattr(settings, "openrouter_api_key")
-    assert not hasattr(settings, "litellm_api_key")
+    assert hasattr(settings, "litellm_api_key")
+    assert settings.litellm_base_url == settings.openrouter_base_url
 
 
 def test_chat_service_uses_openrouter_settings(monkeypatch):

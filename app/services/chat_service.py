@@ -909,23 +909,6 @@ class ChatService:
 
         return 0.0
 
-    def _resolve_usage_cost_usd(
-        self,
-        *,
-        response_cost_usd: float,
-        input_tokens: int,
-        output_tokens: int,
-    ) -> float:
-        """Use OpenRouter billed cost when present, otherwise estimate from token usage."""
-        reported_cost = max(0.0, float(response_cost_usd or 0.0))
-        if reported_cost > 0:
-            return reported_cost
-        return max(0, int(input_tokens or 0)) * float(
-            self.settings.openrouter_chat_input_cost_per_token_usd
-        ) + max(0, int(output_tokens or 0)) * float(
-            self.settings.openrouter_chat_output_cost_per_token_usd
-        )
-
     async def _get_openrouter_user_context(
         self, user_id: str
     ) -> Tuple[Optional[str], Dict[str, Any]]:
@@ -1013,12 +996,8 @@ class ChatService:
                 app_logger.warning(f"OpenRouter usage parse failed: {exc}")
 
             if usage:
-                response_cost_usd = self._resolve_usage_cost_usd(
-                    response_cost_usd=self._extract_openrouter_response_cost_usd(
-                        completion
-                    ),
-                    input_tokens=int(usage.get("input") or 0),
-                    output_tokens=int(usage.get("output") or 0),
+                response_cost_usd = self._extract_openrouter_response_cost_usd(
+                    completion
                 )
                 self._usage_events.append(
                     {
@@ -1127,12 +1106,8 @@ class ChatService:
                 app_logger.warning(f"OpenRouter usage parse failed: {exc}")
 
             if usage:
-                response_cost_usd = self._resolve_usage_cost_usd(
-                    response_cost_usd=self._extract_openrouter_response_cost_usd(
-                        completion
-                    ),
-                    input_tokens=int(usage.get("input") or 0),
-                    output_tokens=int(usage.get("output") or 0),
+                response_cost_usd = self._extract_openrouter_response_cost_usd(
+                    completion
                 )
                 self._usage_events.append(
                     {

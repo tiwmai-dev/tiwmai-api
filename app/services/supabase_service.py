@@ -9,6 +9,7 @@ from supabase import Client, create_client
 
 from app.core.config import get_settings
 from app.core.logging import app_logger
+from app.services.supabase_metrics import increment_query_count
 
 
 class SupabaseService:
@@ -94,6 +95,7 @@ class SupabaseService:
         for attempt in range(1, max_attempts + 1):
             try:
                 async with self._run_semaphore:
+                    increment_query_count()
                     return await asyncio.to_thread(func, *args, **kwargs)
             except Exception as exc:
                 is_retryable = self._is_transient_connection_error(exc)

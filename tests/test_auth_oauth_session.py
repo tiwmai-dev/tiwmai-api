@@ -368,6 +368,16 @@ def test_registration_error_detail_maps_duplicate_email():
 
 
 @pytest.mark.unit
+def test_registration_error_detail_maps_duplicate_username():
+    assert (
+        _registration_error_detail(
+            RuntimeError('duplicate key value violates unique constraint "profiles_username_key"')
+        )
+        == "ชื่อผู้ใช้นี้ถูกใช้แล้ว"
+    )
+
+
+@pytest.mark.unit
 def test_registration_error_detail_maps_weak_password():
     assert (
         _registration_error_detail(
@@ -433,3 +443,23 @@ async def test_student_register_updates_profile_with_student_id():
         None,
         {"student_id": "S001"},
     )
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_register_user_rejects_duplicate_username():
+    service = object.__new__(AuthService)
+    service._username_is_taken = AsyncMock(return_value=True)
+    service.supabase = SimpleNamespace(run=AsyncMock())
+
+    with pytest.raises(HTTPException) as exc_info:
+        await AuthService.register_user(
+            service,
+            username="existing-user",
+            password="password123",
+            email="new@example.com",
+        )
+
+    assert exc_info.value.status_code == 400
+    assert exc_info.value.detail == "ชื่อผู้ใช้นี้ถูกใช้แล้ว"
+    service.supabase.run.assert_not_awaited()

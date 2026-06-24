@@ -64,6 +64,18 @@ class LLMProcessingError(BaseAPIException):
         super().__init__(message, status_code=500, details=details)
 
 
+class OCRProcessingError(LLMProcessingError):
+    """OCR/LLM processing error exception for legacy tutor endpoints."""
+
+
+class TyphoonOCRError(OCRProcessingError):
+    """TyphoonOCR API error exception."""
+
+    def __init__(self, message: str, api_response: Optional[Dict[str, Any]] = None):
+        details = {"api_response": api_response} if api_response else None
+        super().__init__(f"TyphoonOCR API error: {message}", details=details)
+
+
 class RateLimitError(BaseAPIException):
     """Rate limit exceeded error exception."""
 
@@ -90,3 +102,16 @@ class StorageError(BaseAPIException):
 
     def __init__(self, message: str, details: Optional[Dict[str, Any]] = None):
         super().__init__(message, status_code=500, details=details)
+
+
+class S3StorageError(StorageError):
+    """S3-compatible storage error exception for legacy tutor endpoints."""
+
+
+class ProcessingTimeoutError(OCRProcessingError):
+    """Processing timeout error exception."""
+
+    def __init__(self, timeout_seconds: int):
+        message = f"Processing timeout after {timeout_seconds} seconds"
+        details = {"timeout_seconds": timeout_seconds}
+        super().__init__(message, details=details)
