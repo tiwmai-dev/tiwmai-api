@@ -1,6 +1,116 @@
 import pytest
+from unittest.mock import AsyncMock
 
 from app.services.chat_service import ChatService
+
+
+@pytest.mark.unit
+def test_study_solver_prompt_requires_off_topic_scope_during_active_question():
+    service = ChatService()
+
+    prompt = service._create_chat_prompt(
+        user_message="ช่วยอธิบายข้อนี้หน่อย",
+        course_context=None,
+        system_context=None,
+        conversation_history=[],
+        conversation_summary="",
+        user_id="student-1",
+        question_context={"question_text": "2 + 2 เท่ากับเท่าไร"},
+        chat_mode="study_solver",
+        active_question_session=True,
+    )
+
+    assert "ข้อกำหนดเรื่องขอบเขตการตอบ" in prompt
+    assert "ให้ปฏิเสธอย่างสุภาพ" in prompt
+    assert "ชวนกลับมาโฟกัสโจทย์ปัจจุบัน" in prompt
+
+
+@pytest.mark.unit
+def test_study_solver_prompt_skips_off_topic_scope_without_active_question():
+    service = ChatService()
+
+    prompt = service._create_chat_prompt(
+        user_message="ช่วยแนะนำการเรียน",
+        course_context=None,
+        system_context=None,
+        conversation_history=[],
+        conversation_summary="",
+        user_id="student-1",
+        question_context=None,
+        chat_mode="study_solver",
+        active_question_session=False,
+    )
+
+    assert "ข้อกำหนดเรื่องขอบเขตการตอบ" not in prompt
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    ("message", "expected_fragment"),
+    [
+        ("สวัสดีค่ะ", "ลองบอกได้เลยว่าติดตรงไหน"),
+        ("วันนี้อากาศดีไหม", "ช่วยเฉพาะเรื่องโจทย์ที่กำลังทำอยู่"),
+        ("ช่วยแนะนำหนังหน่อย", "ช่วยเฉพาะเรื่องโจทย์ที่กำลังทำอยู่"),
+    ],
+)
+def test_build_off_topic_refusal_message(message, expected_fragment):
+    response = ChatService._build_off_topic_refusal_message(message)
+    assert expected_fragment in response
+
+
+@pytest.mark.unit
+def test_heuristic_marks_general_chat_as_off_question_context():
+    service = ChatService()
+    should_include, reason, route = service._heuristic_question_context_decision(
+        user_message="วันนี้อากาศดีไหม",
+        parsed_question_context={"question_text": "2 + 2 เท่ากับเท่าไร"},
+        chat_mode="study_solver",
+    )
+
+    assert should_include is False
+    assert reason == "keyword_off_topic"
+    assert route == "general"
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_get_chat_response_refuses_off_topic_without_llm(monkeypatch):
+    service = ChatService()
+
+    async def fail_if_called(*args, **kwargs):
+        raise AssertionError("LLM should not be called for off-topic question chat")
+
+    monkeypatch.setattr(service, "_call_gemini_chat", fail_if_called)
+    monkeypatch.setattr(service, "_call_gemini_chat_with_image", fail_if_called)
+
+    async def fake_energy_status(user_id):
+        return {
+            "daily_limit_thb": 2.0,
+            "used_thb": 0.0,
+            "remaining_thb": 2.0,
+            "remaining_percent": 100.0,
+            "is_exhausted": False,
+        }
+
+    db_service = type(
+        "FakeDb",
+        (),
+        {
+            "get_student_chat_energy_status": fake_energy_status,
+            "record_student_token_usage": AsyncMock(),
+        },
+    )()
+
+    monkeypatch.setattr("app.services.chat_service.get_db_service", lambda: db_service)
+
+    response = await service.get_chat_response(
+        user_message="ช่วยแนะนำหนังสนุกๆ หน่อย",
+        user_id="student-1",
+        question_context='{"question_text": "2 + 2 เท่ากับเท่าไร"}',
+        chat_mode="study_solver",
+    )
+
+    assert "ช่วยเฉพาะเรื่องโจทย์ที่กำลังทำอยู่" in response.content
 
 
 @pytest.mark.unit

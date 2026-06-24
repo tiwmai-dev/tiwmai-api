@@ -268,31 +268,48 @@ class ChatService:
                 else None
             )
 
-            # Create intelligent prompt with context
-            prompt = self._create_chat_prompt(
-                user_message=user_message,
-                course_context=effective_course_context,
-                system_context=effective_system_context,
-                conversation_history=conversation_history,
-                conversation_summary=conversation_summary,
-                user_id=user_id,
-                question_context=effective_question_context,
-                has_image=bool(image_bytes),
-                chat_mode=normalized_mode,
-                learning_context=advisor_learning_context,
-            )
+            active_question_session = bool(parsed_question_context)
+            response = None
+            if (
+                normalized_mode == "study_solver"
+                and active_question_session
+                and not image_bytes
+                and not routed_context.get("should_include_question_context")
+            ):
+                response = self._build_off_topic_refusal_message(user_message)
+                app_logger.info(
+                    "Refusing off-topic study_solver chat for user {} ({})",
+                    user_id,
+                    routed_context.get("classifier_reason", ""),
+                )
 
-            app_logger.info(
-                f"Generating chat response for user {user_id} in course {course_id}"
-            )
-
-            # Call OpenRouter Chat API
-            base_max_tokens = 1000
             model_name = self._resolve_chat_model(
                 chat_mode=normalized_mode,
                 has_image=bool(image_bytes),
             )
-            if image_bytes:
+            if not response:
+                # Create intelligent prompt with context
+                prompt = self._create_chat_prompt(
+                    user_message=user_message,
+                    course_context=effective_course_context,
+                    system_context=effective_system_context,
+                    conversation_history=conversation_history,
+                    conversation_summary=conversation_summary,
+                    user_id=user_id,
+                    question_context=effective_question_context,
+                    has_image=bool(image_bytes),
+                    chat_mode=normalized_mode,
+                    learning_context=advisor_learning_context,
+                    active_question_session=active_question_session,
+                )
+
+                app_logger.info(
+                    f"Generating chat response for user {user_id} in course {course_id}"
+                )
+
+                # Call OpenRouter Chat API
+                base_max_tokens = 1000
+            if not response and image_bytes:
                 app_logger.info(
                     f"Sending image to LLM: bytes={len(image_bytes)} mime={image_mime or 'image/png'}"
                 )
@@ -305,7 +322,7 @@ class ChatService:
                     openrouter_user=openrouter_user,
                     openrouter_metadata=openrouter_metadata,
                 )
-            else:
+            elif not response:
                 response = await self._call_gemini_chat(
                     prompt,
                     base_max_tokens,
@@ -441,6 +458,35 @@ class ChatService:
             return mode
         return self._default_chat_mode
 
+    _SOCIAL_NICETY_KEYWORDS = (
+        "สวัสดี",
+        "hello",
+        "hi",
+        "ขอบคุณ",
+        "thanks",
+        "thank you",
+        "ขอบใจ",
+    )
+
+    @staticmethod
+    def _is_social_nicety_message(user_message: str) -> bool:
+        text = re.sub(r"\s+", " ", str(user_message or "").strip().lower())
+        if not text or len(text) > 48:
+            return False
+        return any(keyword in text for keyword in ChatService._SOCIAL_NICETY_KEYWORDS)
+
+    @staticmethod
+    def _build_off_topic_refusal_message(user_message: str) -> str:
+        if ChatService._is_social_nicety_message(user_message):
+            return (
+                "สวัสดีค่ะ 😊 น้องติวช่วยเรื่องโจทย์ที่กำลังทำอยู่ได้นะคะ "
+                "ลองบอกได้เลยว่าติดตรงไหน หรืออยากให้ช่วยไล่คิดขั้นตอนไหนคะ"
+            )
+        return (
+            "ขอโทษนะคะ น้องติวช่วยเฉพาะเรื่องโจทย์ที่กำลังทำอยู่และเนื้อหาการเรียนในโจทย์นี้เท่านั้นค่ะ 🙏\n"
+            "ลองถามเกี่ยวกับข้อนี้ได้เลย เช่น จุดที่งง วิธีคิด หรือขั้นตอนที่อยากให้ช่วยอธิบายนะคะ"
+        )
+
     @staticmethod
     def _learning_advisor_needs_learning_context(user_message: str) -> bool:
         """Load the expensive learning overview only for learning-data questions."""
@@ -516,6 +562,7 @@ class ChatService:
         has_image: bool = False,
         chat_mode: str = "study_solver",
         learning_context: Optional[Dict[str, Any]] = None,
+        active_question_session: bool = False,
     ) -> str:
         """Create chat prompt by mode and keep Thai responses."""
         history_turn_limit = 2
@@ -595,6 +642,17 @@ class ChatService:
             "ถ้าข้อมูลไม่พอให้บอกตรงๆ และตอบยาวประมาณ 3-7 บรรทัดตามความจำเป็น\n"
             "หากผู้ใช้ระบุจุดที่ไม่เข้าใจ ให้ตอบจุดนั้นก่อน"
         )
+
+        if active_question_session:
+            system_prompt += (
+                "\n\nข้อกำหนดเรื่องขอบเขตการตอบ:\n"
+                "ผู้ใช้กำลังทำโจทย์ข้อนี้อยู่ ให้ตอบเฉพาะเรื่องที่เกี่ยวกับโจทย์ แนวคิด วิธีคิด ตัวเลือก "
+                "หรือการเรียนจากเนื้อหาในข้อนี้เท่านั้น\n"
+                "ถ้าข้อความไม่เกี่ยวกับโจทย์หรือการเรียน (เช่น เรื่องส่วนตัว เกม บันเทิง ชีวิตประจำวัน ข่าว "
+                "หรือหัวข้ออื่นที่ไม่ผูกกับข้อนี้) ให้ปฏิเสธอย่างสุภาพ สั้นๆ ไม่เกิน 2-3 ประโยค\n"
+                "ห้ามตอบเนื้อหานอกเรื่องเรียน แล้วชวนกลับมาโฟกัสโจทย์ปัจจุบัน\n"
+                "ถ้าเป็นการทักทายหรือขอบคุณ ให้ตอบสั้นๆ เป็นมิตรแล้วชวนกลับมาถามเรื่องโจทย์"
+            )
 
         allow_direct_answer = self._can_reveal_direct_answer(question_context)
         reveal_solution_after_method = isinstance(question_context, dict) and str(
@@ -1853,6 +1911,28 @@ class ChatService:
                 "keyword_unsure_related",
                 ("course_related" if has_course_context else "general"),
             )
+        off_topic_keywords = (
+            "เล่นเกม",
+            "เกมสนุก",
+            "ดูหนัง",
+            "ฟังเพลง",
+            "การเมือง",
+            "แฟน",
+            "ความรัก",
+            "พนัน",
+            "bitcoin",
+            "คริปโต",
+            "ไปเที่ยว",
+            "ท่องเที่ยว",
+            "อากาศ",
+            "ทำอาหาร",
+            "สูตรอาหาร",
+            "netflix",
+            "football",
+            "ดูบอล",
+        )
+        if any(key in text for key in off_topic_keywords):
+            return False, "keyword_off_topic", "general"
         if any(key in text for key in generic_keywords):
             return False, "keyword_general_chat", "general"
         if any(

@@ -413,9 +413,14 @@ async def test_dashboard_learning_inputs_collects_alias_rows_in_batches():
             return [{"result_id": "result-1", "user_id": "legacy-user"}]
         return []
 
+    async def _get_quizzes_for_courses(course_ids, summary=True):
+        assert course_ids == ["course-1"]
+        return [{"quiz_id": "quiz-1", "course_id": "course-1"}]
+
     service.get_user = _get_user
     service.get_user_enrollments = _get_user_enrollments
     service._filter_in = _filter_in
+    service.get_quizzes_for_courses = _get_quizzes_for_courses
 
     rows = await SupabaseDataService.get_dashboard_learning_inputs(service, "student-1")
 

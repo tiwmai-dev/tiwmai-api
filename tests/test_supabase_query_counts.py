@@ -71,8 +71,10 @@ async def test_get_dashboard_learning_inputs_batches_related_tables(data_service
         side_effect=[
             [{"course_id": "course-1"}],
             [{"lesson_id": "lesson-1", "course_id": "course-1"}],
-            [{"quiz_id": "quiz-1", "course_id": "course-1"}],
         ]
+    )
+    data_service.get_quizzes_for_courses = AsyncMock(
+        return_value=[{"quiz_id": "quiz-1", "course_id": "course-1"}]
     )
     data_service._query = AsyncMock(
         return_value={
@@ -90,5 +92,6 @@ async def test_get_dashboard_learning_inputs_batches_related_tables(data_service
     inputs = await data_service.get_dashboard_learning_inputs("student-1", limit=10)
 
     assert inputs["candidate_user_ids"] == ["student-1"]
-    assert data_service._filter_in.await_count == 3
+    assert data_service._filter_in.await_count == 2
+    assert data_service.get_quizzes_for_courses.await_count == 1
     assert data_service._query.await_count == 1

@@ -1342,6 +1342,30 @@ class SupabaseDataService:
             ),
         )
 
+    async def get_quizzes_for_courses(
+        self, course_ids: List[str], *, summary: bool = True
+    ) -> List[Dict[str, Any]]:
+        unique_course_ids = list(
+            dict.fromkeys(
+                self._normalize_identity(course_id)
+                for course_id in course_ids
+                if self._normalize_identity(course_id)
+            )
+        )
+        if not unique_course_ids:
+            return []
+
+        quiz_groups = await asyncio.gather(
+            *[
+                self.get_quizzes_by_course(course_id, summary=summary)
+                for course_id in unique_course_ids
+            ]
+        )
+        quizzes: List[Dict[str, Any]] = []
+        for rows in quiz_groups:
+            quizzes.extend(rows)
+        return quizzes
+
     async def get_course_quizzes_page(
         self,
         course_id: str,
@@ -2069,13 +2093,7 @@ class SupabaseDataService:
             limit=max(1000, len(course_ids) * 100),
             select=LESSON_SUMMARY_SELECT,
         )
-        quizzes_task = self._filter_in(
-            "quizzes",
-            "course_id",
-            course_ids,
-            limit=max(1000, len(course_ids) * 250),
-            select=QUIZ_SUMMARY_SELECT,
-        )
+        quizzes_task = self.get_quizzes_for_courses(course_ids, summary=True)
         if hasattr(self, "supabase"):
             results_task = self._query(
                 "quiz_results",
