@@ -1,5 +1,6 @@
 """Application configuration settings."""
 
+import os
 from functools import lru_cache
 from typing import List, Optional
 
@@ -257,6 +258,16 @@ class Settings(BaseSettings):
         if text in {"0", "false", "no", "off", "release", "prod", "production", ""}:
             return False
         return False
+
+    @model_validator(mode="after")
+    def configure_vercel_runtime_paths(self):
+        """Use writable /tmp paths on Vercel's read-only function bundle."""
+        if os.getenv("VERCEL") and self.upload_folder.strip() in {
+            "./uploads",
+            "uploads",
+        }:
+            self.upload_folder = "/tmp/uploads"
+        return self
 
     @model_validator(mode="after")
     def fill_legacy_llm_defaults(self):

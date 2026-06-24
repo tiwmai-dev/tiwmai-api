@@ -64,7 +64,7 @@ def create_app(app_settings):
     app_instance.include_router(student_router, prefix="/api/v1")
 
     uploads_dir = Path(app_settings.upload_folder)
-    uploads_dir.mkdir(exist_ok=True)
+    uploads_dir.mkdir(parents=True, exist_ok=True)
     app_instance.mount("/uploads", StaticFiles(directory=str(uploads_dir)), name="uploads")
 
     @app_instance.get("/")
