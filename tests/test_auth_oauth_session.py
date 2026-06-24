@@ -6,7 +6,7 @@ import pytest
 from fastapi import HTTPException
 
 from app.api.student_auth_endpoints import get_current_student
-from app.services.auth_service import AuthService, _registration_error_detail
+from app.services.auth_service import AuthService, _login_error_detail, _registration_error_detail
 from app.services.student_auth_service import StudentAuthService, StudentInfo
 
 
@@ -378,6 +378,14 @@ def test_registration_error_detail_maps_duplicate_username():
 
 
 @pytest.mark.unit
+def test_login_error_detail_maps_unverified_email():
+    assert (
+        _login_error_detail(RuntimeError("Email not confirmed"))
+        == "กรุณายืนยันอีเมลก่อนเข้าสู่ระบบ ตรวจสอบกล่องจดหมายหรือขอส่งอีเมลยืนยันอีกครั้ง"
+    )
+
+
+@pytest.mark.unit
 def test_registration_error_detail_maps_weak_password():
     assert (
         _registration_error_detail(
@@ -463,3 +471,95 @@ async def test_register_user_rejects_duplicate_username():
     assert exc_info.value.status_code == 400
     assert exc_info.value.detail == "ชื่อผู้ใช้นี้ถูกใช้แล้ว"
     service.supabase.run.assert_not_awaited()
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_register_user_sends_verification_email():
+    service = object.__new__(AuthService)
+    service.role = "student"
+    service.settings = SimpleNamespace(
+        student_web_app_url="http://localhost:3000",
+        supabase_oauth_redirect_uri=None,
+        allowed_origins_list=["http://localhost:3000"],
+    )
+    service._username_is_taken = AsyncMock(return_value=False)
+    service._upsert_profile = AsyncMock(return_value={})
+    service._send_verification_email = AsyncMock()
+    service.supabase = SimpleNamespace(
+        run=AsyncMock(
+            return_value={
+                "user": {
+                    "id": "student-1",
+                    "email": "student@example.com",
+                    "email_confirmed_at": None,
+                    "user_metadata": {},
+                    "app_metadata": {"role": "student"},
+                }
+            }
+        ),
+        client=SimpleNamespace(
+            auth=SimpleNamespace(
+                admin=SimpleNamespace(create_user=lambda *_args, **_kwargs: None)
+            )
+        ),
+    )
+
+    result = await AuthService.register_user(
+        service,
+        username="student",
+        password="password123",
+        email="student@example.com",
+    )
+
+    assert result["email_verification_required"] is True
+    service._send_verification_email.assert_awaited_once_with("student@example.com")
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_authenticate_user_rejects_unverified_email():
+    service = object.__new__(AuthService)
+    service.role = "student"
+    service._resolve_login_email = AsyncMock(return_value="student@example.com")
+    service._get_profile = AsyncMock(return_value={"username": "student", "role": "student"})
+    service._upsert_profile = AsyncMock()
+    session = SimpleNamespace(
+        access_token="access-token",
+        refresh_token="refresh-token",
+        expires_in=3600,
+    )
+    auth_user = SimpleNamespace(
+        id="student-1",
+        email="student@example.com",
+        email_confirmed_at=None,
+        phone=None,
+        user_metadata={"username": "student"},
+        app_metadata={"role": "student"},
+    )
+    service.supabase = SimpleNamespace(
+        run=AsyncMock(
+            return_value=SimpleNamespace(
+                session=session,
+                user=auth_user,
+            )
+        ),
+        anon_client=SimpleNamespace(
+            auth=SimpleNamespace(
+                sign_in_with_password=lambda *_args, **_kwargs: SimpleNamespace(
+                    session=session,
+                    user=auth_user,
+                )
+            )
+        ),
+    )
+
+    with pytest.raises(HTTPException) as exc_info:
+        await AuthService.authenticate_user(
+            service,
+            username="student",
+            password="password123",
+        )
+
+    assert exc_info.value.status_code == 401
+    assert "ยืนยันอีเมล" in str(exc_info.value.detail)

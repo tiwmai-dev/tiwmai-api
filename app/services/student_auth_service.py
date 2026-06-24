@@ -4,7 +4,11 @@ from typing import Any, Dict, Optional
 
 from pydantic import BaseModel
 
-from app.services.auth_service import AuthService, UserInfo
+from app.services.auth_service import (
+    AuthService,
+    REGISTRATION_VERIFY_EMAIL_MESSAGE,
+    UserInfo,
+)
 
 
 class StudentInfo(BaseModel):
@@ -71,7 +75,10 @@ class StudentAuthService(AuthService):
                 {"student_id": student_id},
             )
         result["student_id"] = student_id
-        result["message"] = "Student registered successfully"
+        if result.get("email_verification_required"):
+            result["message"] = REGISTRATION_VERIFY_EMAIL_MESSAGE
+        else:
+            result["message"] = "Student registered successfully"
         return result
 
     async def resend_verification_email(self, email: str) -> Dict[str, str]:
