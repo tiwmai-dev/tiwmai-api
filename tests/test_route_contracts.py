@@ -33,7 +33,6 @@ STUDENT_FRONTEND_PATHS = {
     "/api/v1/student/users/{user_id}/quizzes/{quiz_id}/submit",
     "/api/v1/student/users/{user_id}/quizzes/{quiz_id}/results",
     "/api/v1/student/users/{user_id}/payment-history",
-    "/api/v1/student/users/{user_id}/courses/{course_id}/analysis-summary",
     "/api/v1/student/enrollments",
     "/api/v1/student/payments/promptpay/create-intent",
     "/api/v1/student/payments/promptpay/confirm",
