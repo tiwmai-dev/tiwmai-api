@@ -348,7 +348,7 @@ class AuthService:
             app_logger.warning(f"Username availability check failed for {value}: {e}")
             return False
 
-    def _email_verification_redirect_url(self) -> str:
+    def _frontend_callback_redirect_url(self) -> str:
         configured = str(self.settings.student_web_app_url or "").strip().rstrip("/")
         if configured:
             return f"{configured}/auth/callback"
@@ -359,8 +359,11 @@ class AuthService:
             return f"{self.settings.allowed_origins_list[0].rstrip('/')}/auth/callback"
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Email verification redirect URL is not configured",
+            detail="Frontend callback redirect URL is not configured",
         )
+
+    def _email_verification_redirect_url(self) -> str:
+        return self._frontend_callback_redirect_url()
 
     async def _send_verification_email(self, email: str) -> None:
         normalized_email = str(email or "").strip()
@@ -1016,10 +1019,7 @@ class AuthService:
         allowed_providers = {"google", "github", "azure", "gitlab", "discord"}
         if normalized_provider not in allowed_providers:
             raise HTTPException(status_code=400, detail="Unsupported OAuth provider")
-        redirect_to = (
-            str(self.settings.supabase_oauth_redirect_uri or "").strip()
-            or self.settings.allowed_origins_list[0]
-        )
+        redirect_to = self._frontend_callback_redirect_url()
         params = {
             "provider": normalized_provider,
             "redirect_to": redirect_to,

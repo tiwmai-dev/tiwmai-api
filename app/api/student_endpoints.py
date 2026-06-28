@@ -10,7 +10,6 @@ from app.api.student_handlers import (
     confirm_promptpay_payment_and_enroll,
     create_promptpay_payment_intent,
     enroll_user_in_course,
-    generate_student_analysis_summary,
     get_course_learning_overview,
     get_course_lessons,
     get_course_mock_exam_leaderboard,
@@ -94,11 +93,6 @@ router.add_api_route(
     "/student/users/{user_id}/quizzes/{quiz_id}/results",
     get_user_quiz_results,
     methods=["GET"],
-)
-router.add_api_route(
-    "/student/users/{user_id}/courses/{course_id}/analysis-summary",
-    generate_student_analysis_summary,
-    methods=["POST"],
 )
 router.add_api_route(
     "/student/users/{user_id}/payment-history",

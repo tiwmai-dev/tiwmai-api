@@ -563,3 +563,19 @@ async def test_authenticate_user_rejects_unverified_email():
 
     assert exc_info.value.status_code == 401
     assert "ยืนยันอีเมล" in str(exc_info.value.detail)
+
+
+@pytest.mark.unit
+def test_get_oauth_authorization_url_prefers_student_web_app_url():
+    service = object.__new__(AuthService)
+    service.settings = SimpleNamespace(
+        supabase_url="https://example.supabase.co",
+        student_web_app_url="https://tiwmai-student-web-git-staging-tewmai.vercel.app",
+        supabase_oauth_redirect_uri="http://localhost:3000/auth/callback",
+        allowed_origins_list=["http://localhost:3000"],
+    )
+
+    authorization_url = AuthService.get_oauth_authorization_url(service, provider="Google")
+
+    assert "redirect_to=https%3A%2F%2Ftiwmai-student-web-git-staging-tewmai.vercel.app%2Fauth%2Fcallback" in authorization_url
+    assert "provider=google" in authorization_url
