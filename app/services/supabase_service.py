@@ -42,8 +42,19 @@ class SupabaseService:
             "timed out",
             "remoteprotocolerror",
             "protocol_error",
+            "resource temporarily unavailable",
+            "temporarily unavailable",
+            "errno 11",
+            "statement timeout",
+            "canceling statement",
+            "57014",
         )
-        return any(signature in message for signature in transient_signatures)
+        if any(signature in message for signature in transient_signatures):
+            return True
+        error_code = getattr(error, "code", None)
+        if error_code is not None and str(error_code).strip() == "57014":
+            return True
+        return False
 
     def _reset_clients(self) -> None:
         self._service_client = None

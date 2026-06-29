@@ -8,6 +8,7 @@ from app.services.data_service import SupabaseDataService
 
 
 def _make_service():
+    SupabaseDataService._billing_email_column_missing = None
     return object.__new__(SupabaseDataService)
 
 
@@ -421,6 +422,45 @@ async def test_get_enrollment_user_ids_by_billing_email_falls_back_when_column_m
     )
 
     assert user_ids == ["google_113576115499500102728"]
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_get_enrollment_user_ids_by_billing_email_skips_missing_column_query_after_first_failure():
+    service = _make_service()
+    call_count = 0
+
+    async def _filter(table, where, include_deleted=False, limit=50):
+        nonlocal call_count
+        key, value = where
+        if table == "enrollments" and key == "billing_email":
+            call_count += 1
+            raise APIError(
+                {
+                    "message": "column enrollments.billing_email does not exist",
+                    "code": "42703",
+                    "hint": None,
+                    "details": None,
+                }
+            )
+        if table == "profiles" and key == "email" and value == "student@example.com":
+            return [{"user_id": "legacy-profile-user"}]
+        if table == "enrollments" and key == "user_id":
+            return [{"enrollment_id": "enr-fallback", "user_id": value}]
+        return []
+
+    service._filter = AsyncMock(side_effect=_filter)
+
+    first = await SupabaseDataService.get_enrollment_user_ids_by_billing_email(
+        service, "student@example.com"
+    )
+    second = await SupabaseDataService.get_enrollment_user_ids_by_billing_email(
+        service, "student@example.com"
+    )
+
+    assert first == ["legacy-profile-user"]
+    assert second == ["legacy-profile-user"]
+    assert call_count == 1
 
 
 @pytest.mark.unit
