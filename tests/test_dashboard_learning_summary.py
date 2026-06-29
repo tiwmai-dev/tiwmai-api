@@ -120,7 +120,7 @@ def test_dashboard_course_stats_excludes_mock_exam_from_progress_but_counts_spli
             ],
         },
     ]
-    assert row["learningActivityDays"] == ["2026-05-06"]
+    assert row["learningActivityDays"] == ["2026-05-05", "2026-05-06"]
 
 
 @pytest.mark.unit

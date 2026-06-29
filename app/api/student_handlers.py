@@ -352,6 +352,35 @@ def _parse_timestamp_ms(value: Any) -> float:
     return dt.timestamp() * 1000
 
 
+def _to_bangkok_day_key(value: Any) -> Optional[str]:
+    timestamp_ms = _parse_timestamp_ms(value)
+    if timestamp_ms <= 0:
+        return None
+    dt = datetime.fromtimestamp(timestamp_ms / 1000, tz=PAYMENT_TIME_ZONE)
+    return dt.strftime('%Y-%m-%d')
+
+
+def _collect_learning_activity_days(course: Dict[str, Any], course_results: List[Dict[str, Any]]) -> List[str]:
+    day_keys: Set[str] = set()
+    for source in (
+        course.get('learning_activity_days'),
+        (course.get('enrollment') or {}).get('learning_activity_days') if isinstance(course.get('enrollment'), dict) else None,
+    ):
+        if not isinstance(source, list):
+            continue
+        for day in source:
+            text = str(day or '').strip()
+            if text:
+                day_keys.add(text)
+    for item in course_results:
+        for field in ('submitted_at', 'updated_at', 'created_at'):
+            day_key = _to_bangkok_day_key(item.get(field))
+            if day_key:
+                day_keys.add(day_key)
+                break
+    return sorted(day_keys)
+
+
 def _format_attempt_label(submitted_at_ms: float, fallback_index: int) -> str:
     if submitted_at_ms > 0:
         dt = datetime.fromtimestamp(submitted_at_ms / 1000)
@@ -388,6 +417,7 @@ def _merge_course_with_enrollment(course: Dict[str, Any], enrollment: Dict[str, 
     row['completed_questions'] = enrollment.get('completed_questions', row.get('completed_questions', 0))
     row['total_questions'] = enrollment.get('total_questions', row.get('total_questions', 0))
     row['last_activity'] = enrollment.get('last_activity', row.get('last_activity'))
+    row['learning_activity_days'] = enrollment.get('learning_activity_days') or row.get('learning_activity_days') or []
     return row
 
 
@@ -576,7 +606,7 @@ def _build_dashboard_course_stats(courses: List[Dict[str, Any]], lessons: List[D
         progress = round(completed_quizzes / total_quizzes * 100) if total_quizzes > 0 else _coerce_number(course.get('progress'))
         submitted_values = [str(item.get('submitted_at') or '') for item in course_results if str(item.get('submitted_at') or '')]
         last_submitted_at = sorted(submitted_values)[-1] if submitted_values else None
-        stats[course_id] = {'totalLessons': len(course_lessons), 'completedLessons': len(attempted_lesson_ids), 'totalQuizzes': total_quizzes, 'completedQuizzes': completed_quizzes, 'totalQuestions': question_attempts if question_attempts > 0 else scored_attempt_count, 'completedQuestions': correct_answers if question_attempts > 0 else scored_attempt_count, 'lessonRows': computed_lesson_rows, 'attemptRows': attempt_rows, 'topicRows': topic_rows, 'topicRowsByLesson': topic_rows_by_lesson, 'minutesThisWeek': int((time_spent_seconds_this_week + 59) // 60) if time_spent_seconds_this_week > 0 else 0, 'progress': max(0, min(100, round(progress))), 'averageScore': round(total_difficulty_correct / total_difficulty_questions * 100) if total_difficulty_questions > 0 else round(correct_answers / question_attempts * 100) if question_attempts > 0 else 0, 'difficultyScore': difficulty_score, 'scoreSplit': score_split, 'lastActivity': last_submitted_at, 'learningActivityDays': [str(day) for day in course.get('learning_activity_days', []) if str(day or '').strip()] if isinstance(course.get('learning_activity_days'), list) else []}
+        stats[course_id] = {'totalLessons': len(course_lessons), 'completedLessons': len(attempted_lesson_ids), 'totalQuizzes': total_quizzes, 'completedQuizzes': completed_quizzes, 'totalQuestions': question_attempts if question_attempts > 0 else scored_attempt_count, 'completedQuestions': correct_answers if question_attempts > 0 else scored_attempt_count, 'lessonRows': computed_lesson_rows, 'attemptRows': attempt_rows, 'topicRows': topic_rows, 'topicRowsByLesson': topic_rows_by_lesson, 'minutesThisWeek': int((time_spent_seconds_this_week + 59) // 60) if time_spent_seconds_this_week > 0 else 0, 'progress': max(0, min(100, round(progress))), 'averageScore': round(total_difficulty_correct / total_difficulty_questions * 100) if total_difficulty_questions > 0 else round(correct_answers / question_attempts * 100) if question_attempts > 0 else 0, 'difficultyScore': difficulty_score, 'scoreSplit': score_split, 'lastActivity': last_submitted_at, 'learningActivityDays': _collect_learning_activity_days(course, course_results)}
     return stats
 
 
@@ -1487,7 +1517,30 @@ async def get_user_enrolled_courses(user_id: str, limit: int=50, credentials: Op
         raise HTTPException(status_code=500, detail='Failed to get enrolled courses')
 
 
-async def get_dashboard_learning_summary(user_id: str, include_ai: bool=False, course_limit: int=50, credentials: Optional[HTTPAuthorizationCredentials]=Depends(STUDENT_BEARER_OPTIONAL), student_auth_service: StudentAuthService=Depends(_get_student_auth_service), data_service=Depends(get_data_service)):
+def _dashboard_courses_by_id(courses: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
+    courses_by_id: Dict[str, Dict[str, Any]] = {}
+    for course in courses:
+        course_id = str(course.get('course_id') or course.get('id') or '').strip()
+        if course_id:
+            courses_by_id[course_id] = course
+    return courses_by_id
+
+
+async def _fetch_dashboard_learning_inputs(data_service, user_id: str, limit: int, *, skip_cache: bool = False) -> Dict[str, Any]:
+    get_inputs = getattr(data_service, 'get_dashboard_learning_inputs', None)
+    if not callable(get_inputs):
+        raise AttributeError('get_dashboard_learning_inputs is not available')
+    if skip_cache:
+        cache_clear = getattr(data_service, '_cache_clear', None)
+        if callable(cache_clear):
+            cache_clear(f'dashboard_inputs:{user_id}:')
+    try:
+        return await get_inputs(user_id, limit=limit, skip_cache=skip_cache)
+    except TypeError:
+        return await get_inputs(user_id, limit=limit)
+
+
+async def get_dashboard_learning_summary(user_id: str, include_ai: bool=False, course_limit: int=50, nocache: bool=False, credentials: Optional[HTTPAuthorizationCredentials]=Depends(STUDENT_BEARER_OPTIONAL), student_auth_service: StudentAuthService=Depends(_get_student_auth_service), data_service=Depends(get_data_service)):
     """Return enrolled courses plus computed learning stats for dashboard views."""
     del include_ai
     try:
@@ -1507,10 +1560,10 @@ async def get_dashboard_learning_summary(user_id: str, include_ai: bool=False, c
                 quizzes.extend(await data_service.get_quizzes_by_course(course_id))
             formatted_courses = [_format_student_course(course) for course in enrolled_courses]
             return {'user_id': user_id, 'courses': formatted_courses, 'course_stats': _build_dashboard_course_stats(enrolled_courses, lessons, quizzes, quiz_results), 'generated_at': datetime.utcnow().isoformat()}
-        inputs = await get_inputs(user_id, limit=safe_limit)
+        inputs = await _fetch_dashboard_learning_inputs(data_service, user_id, safe_limit, skip_cache=bool(nocache))
         candidate_user_ids = inputs.get('candidate_user_ids') or []
         candidate_rank = {str(candidate_id): idx for idx, candidate_id in enumerate(candidate_user_ids)}
-        courses_by_id = {str(course.get('course_id') or ''): course for course in inputs.get('courses', []) if str(course.get('course_id') or '')}
+        courses_by_id = _dashboard_courses_by_id(inputs.get('courses', []))
         merged_courses = []
         for enrollment in inputs.get('enrollments', []):
             course_id = str(enrollment.get('course_id') or '').strip()
@@ -1518,6 +1571,16 @@ async def get_dashboard_learning_summary(user_id: str, include_ai: bool=False, c
             if not course:
                 continue
             merged_courses.append(_merge_course_with_enrollment(course, enrollment))
+        if inputs.get('enrollments') and not merged_courses and not nocache:
+            inputs = await _fetch_dashboard_learning_inputs(data_service, user_id, safe_limit, skip_cache=True)
+            courses_by_id = _dashboard_courses_by_id(inputs.get('courses', []))
+            merged_courses = []
+            for enrollment in inputs.get('enrollments', []):
+                course_id = str(enrollment.get('course_id') or '').strip()
+                course = courses_by_id.get(course_id)
+                if not course:
+                    continue
+                merged_courses.append(_merge_course_with_enrollment(course, enrollment))
         deduped_results = []
         seen_result_ids = set()
         for row in sorted(inputs.get('quiz_results', []), key=lambda item: (candidate_rank.get(str(item.get('user_id') or ''), len(candidate_rank)), str(item.get('submitted_at') or item.get('created_at') or ''))):

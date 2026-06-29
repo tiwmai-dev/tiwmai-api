@@ -4,7 +4,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from app.services.data_service import SupabaseDataService
+from app.services.data_service import SupabaseDataService, QUIZ_SUMMARY_SELECT
 
 
 @pytest.fixture
@@ -63,6 +63,25 @@ async def test_get_course_learning_overview_uses_direct_enrollment_lookup(data_s
     data_service.get_user_enrollment_for_course.assert_awaited_once_with(
         "student-1", "course-1"
     )
+
+
+@pytest.mark.asyncio
+async def test_get_quizzes_for_courses_uses_bounded_per_course_queries(data_service):
+    data_service.get_quizzes_by_course = AsyncMock(
+        side_effect=[
+            [{"quiz_id": "quiz-1", "course_id": "course-1", "status": "active"}],
+            [{"quiz_id": "quiz-2", "course_id": "course-2", "status": "active"}],
+        ]
+    )
+
+    quizzes = await data_service.get_quizzes_for_courses(
+        ["course-1", "course-2"], summary=True
+    )
+
+    assert len(quizzes) == 2
+    assert data_service.get_quizzes_by_course.await_count == 2
+    data_service.get_quizzes_by_course.assert_any_await("course-1", summary=True)
+    data_service.get_quizzes_by_course.assert_any_await("course-2", summary=True)
 
 
 @pytest.mark.asyncio

@@ -154,11 +154,15 @@ class AuthService:
     """Service for handling instructor authentication through Supabase."""
 
     role = "instructor"
+    JWT_PAYLOAD_CACHE_MAX_ENTRIES = 512
+    JWT_PAYLOAD_CACHE_DEFAULT_TTL_SECONDS = 3600
+    REST_AUTH_TIMEOUT_SECONDS = 3.0
 
     def __init__(self):
         self.settings = get_settings()
         self.supabase = get_supabase_service()
         self._verified_auth_users: Dict[str, Dict[str, Any]] = {}
+        self._jwt_payload_cache: Dict[str, Dict[str, Any]] = {}
         self._profile_cache: Dict[str, Dict[str, Any]] = {}
 
     @property
@@ -182,7 +186,7 @@ class AuthService:
         if not supabase_url or not api_key:
             raise ValueError("Supabase REST auth lookup is not configured")
 
-        async with httpx.AsyncClient(timeout=10.0) as client:
+        async with httpx.AsyncClient(timeout=self.REST_AUTH_TIMEOUT_SECONDS) as client:
             response = await client.get(
                 f"{supabase_url}/auth/v1/user",
                 headers={
@@ -632,43 +636,56 @@ class AuthService:
             "user": user_info.model_dump(),
         }
 
-    async def verify_jwt_token(self, token: str) -> Dict[str, Any]:
-        """Verify a Supabase access token and return its JWT payload."""
-        if not token:
-            raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED, detail="Missing access token"
-            )
-        verified_users = getattr(self, "_verified_auth_users", {})
-        cached_user = verified_users.get(token)
-        if cached_user:
-            return {
-                "sub": cached_user["id"],
-                "email": cached_user.get("email"),
-                "exp": int(time.time()) + 3600,
-            }
+    def _get_cached_jwt_payload(self, token: str) -> Optional[Dict[str, Any]]:
+        cache = getattr(self, "_jwt_payload_cache", {})
+        entry = cache.get(token)
+        if not entry:
+            return None
+        if int(time.time()) >= int(entry.get("expires_at") or 0):
+            cache.pop(token, None)
+            self._jwt_payload_cache = cache
+            return None
+        payload = entry.get("payload")
+        return dict(payload) if isinstance(payload, dict) else None
 
+    def _cache_jwt_payload(self, token: str, payload: Dict[str, Any]) -> None:
+        now = int(time.time())
+        exp = payload.get("exp")
         try:
-            user = await self._fetch_auth_user(token)
-            verified_users[token] = user
-            self._verified_auth_users = verified_users
-            return {
-                "sub": user["id"],
-                "email": user.get("email"),
-                "exp": int(time.time()) + 3600,
-            }
-        except Exception as auth_api_error:
-            app_logger.warning(
-                "Supabase Auth API token verification failed (%s); trying local JWT verification.",
-                auth_api_error,
-            )
+            cache_until = min(int(exp), now + self.JWT_PAYLOAD_CACHE_DEFAULT_TTL_SECONDS)
+        except (TypeError, ValueError):
+            cache_until = now + self.JWT_PAYLOAD_CACHE_DEFAULT_TTL_SECONDS
+        if cache_until <= now:
+            return
 
+        cache = getattr(self, "_jwt_payload_cache", {})
+        cache[token] = {"payload": dict(payload), "expires_at": cache_until}
+        if len(cache) > self.JWT_PAYLOAD_CACHE_MAX_ENTRIES:
+            self._prune_jwt_payload_cache(cache)
+        else:
+            self._jwt_payload_cache = cache
+
+    def _prune_jwt_payload_cache(
+        self, cache: Optional[Dict[str, Dict[str, Any]]] = None
+    ) -> None:
+        cache = cache if cache is not None else getattr(self, "_jwt_payload_cache", {})
+        now = int(time.time())
+        for token in list(cache.keys()):
+            if now >= int(cache[token].get("expires_at") or 0):
+                cache.pop(token, None)
+        while len(cache) > self.JWT_PAYLOAD_CACHE_MAX_ENTRIES:
+            oldest_token = min(
+                cache.items(), key=lambda item: int(item[1].get("expires_at") or 0)
+            )[0]
+            cache.pop(oldest_token, None)
+        self._jwt_payload_cache = cache
+
+    def _try_decode_local_jwt(self, token: str) -> Optional[Dict[str, Any]]:
+        """Decode JWT locally when shared-secret verification is configured."""
         jwt_algorithm = str(self.settings.jwt_algorithm or "HS256").upper()
-        # Local secret verification works only for shared-secret algorithms.
-        # New Supabase signing keys (e.g. ECC P-256 / ES256) must be validated
-        # via Supabase Auth (or JWKS) instead of local secret decode.
         if self.settings.supabase_jwt_secret and jwt_algorithm.startswith("HS"):
             try:
-                payload = jwt.decode(
+                return jwt.decode(
                     token,
                     self.settings.supabase_jwt_secret,
                     algorithms=[self.settings.jwt_algorithm or "HS256"],
@@ -676,31 +693,65 @@ class AuthService:
                     options={"verify_aud": bool(self.settings.jwt_audience)},
                     leeway=30,
                 )
-                return payload
             except jwt.ExpiredSignatureError:
                 raise HTTPException(
                     status_code=status.HTTP_401_UNAUTHORIZED, detail="Token has expired"
                 )
-            except jwt.InvalidTokenError as e:
-                app_logger.warning(
-                    "Local Supabase JWT verification failed (%s).",
-                    e,
+            except jwt.InvalidTokenError as exc:
+                app_logger.debug("Local Supabase JWT verification failed (%s).", exc)
+
+        if self.settings.secret_key:
+            try:
+                return jwt.decode(
+                    token,
+                    self.settings.secret_key,
+                    algorithms=["HS256"],
+                    options={"verify_aud": False},
+                    leeway=30,
                 )
+            except jwt.ExpiredSignatureError:
+                raise HTTPException(
+                    status_code=status.HTTP_401_UNAUTHORIZED, detail="Token has expired"
+                )
+            except jwt.InvalidTokenError as exc:
+                app_logger.debug("Local app JWT verification failed (%s).", exc)
+        return None
+
+    async def verify_jwt_token(self, token: str) -> Dict[str, Any]:
+        """Verify a Supabase access token and return its JWT payload."""
+        if not token:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED, detail="Missing access token"
+            )
+
+        cached_payload = self._get_cached_jwt_payload(token)
+        if cached_payload is not None:
+            return cached_payload
+
+        local_payload = self._try_decode_local_jwt(token)
+        if local_payload is not None:
+            self._cache_jwt_payload(token, local_payload)
+            return local_payload
 
         try:
-            return jwt.decode(
-                token,
-                self.settings.secret_key,
-                algorithms=["HS256"],
-                options={"verify_aud": False},
-                leeway=30,
+            user = await self._fetch_auth_user(token)
+            verified_users = getattr(self, "_verified_auth_users", {})
+            verified_users[token] = user
+            self._verified_auth_users = verified_users
+            payload = {
+                "sub": user["id"],
+                "email": user.get("email"),
+                "exp": int(time.time()) + self.JWT_PAYLOAD_CACHE_DEFAULT_TTL_SECONDS,
+            }
+            self._cache_jwt_payload(token, payload)
+            return payload
+        except HTTPException:
+            raise
+        except Exception as auth_api_error:
+            app_logger.warning(
+                "Supabase Auth API token verification failed (%s); trying local JWT verification.",
+                auth_api_error,
             )
-        except jwt.ExpiredSignatureError:
-            raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED, detail="Token has expired"
-            )
-        except jwt.InvalidTokenError as e:
-            app_logger.warning("Local app JWT verification failed (%s).", e)
 
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid access token"

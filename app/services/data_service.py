@@ -24,6 +24,7 @@ LEARNING_ACTIVITY_TIME_ZONE = ZoneInfo("Asia/Bangkok")
 LEARNING_ACTIVITY_DAY_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 MAX_LEARNING_ACTIVITY_DAYS = 90
 READ_CACHE_TTL_SECONDS = 45.0
+DASHBOARD_CACHE_TTL_SECONDS = 120.0
 
 COURSE_SUMMARY_SELECT = ",".join(
     (
@@ -353,6 +354,8 @@ class SupabaseTableAdapter:
 
 class SupabaseDataService:
     """Data service backed by Supabase Postgres."""
+
+    _billing_email_column_missing: Optional[bool] = None
 
     def __init__(self) -> None:
         self.settings = get_settings()
@@ -771,6 +774,11 @@ class SupabaseDataService:
         if not normalized_email:
             return []
 
+        if SupabaseDataService._billing_email_column_missing:
+            return await self._get_enrollment_user_ids_from_profile_email(
+                normalized_email, limit=limit
+            )
+
         try:
             rows = await self._filter(
                 "enrollments",
@@ -783,6 +791,7 @@ class SupabaseDataService:
                 error, table="enrollments", column="billing_email"
             ):
                 raise
+            SupabaseDataService._billing_email_column_missing = True
             app_logger.warning(
                 "Enrollment lookup fallback: missing enrollments.billing_email column."
             )
@@ -794,6 +803,7 @@ class SupabaseDataService:
                 error, table="enrollments", column="billing_email"
             ):
                 raise
+            SupabaseDataService._billing_email_column_missing = True
             app_logger.warning(
                 "Enrollment lookup fallback: missing enrollments.billing_email column."
             )
@@ -1355,16 +1365,25 @@ class SupabaseDataService:
         if not unique_course_ids:
             return []
 
-        quiz_groups = await asyncio.gather(
-            *[
-                self.get_quizzes_by_course(course_id, summary=summary)
-                for course_id in unique_course_ids
-            ]
-        )
+        # Per-course queries use cache and avoid a single large IN query that can
+        # hit Postgres statement timeouts on Supabase.
+        batch_size = 2
         quizzes: List[Dict[str, Any]] = []
-        for rows in quiz_groups:
-            quizzes.extend(rows)
-        return quizzes
+        for index in range(0, len(unique_course_ids), batch_size):
+            batch = unique_course_ids[index : index + batch_size]
+            batch_results = await asyncio.gather(
+                *(
+                    self.get_quizzes_by_course(course_id, summary=summary)
+                    for course_id in batch
+                )
+            )
+            for rows in batch_results:
+                quizzes.extend(rows)
+        return sorted(
+            quizzes,
+            key=lambda row: str(row.get("created_at") or ""),
+            reverse=True,
+        )
 
     async def get_course_quizzes_page(
         self,
@@ -1768,17 +1787,24 @@ class SupabaseDataService:
     async def _resolve_enrollment_identity_candidates(
         self, user_id: str, *, limit: int = 50
     ) -> Tuple[List[str], Dict[str, Dict[str, Any]]]:
+        cache_key = f"identity_candidates:{self._normalize_identity(user_id)}:{int(limit or 50)}"
+        cached = self._cache_get(cache_key)
+        if cached is not None:
+            return cached
+
         primary_candidate_ids = await self._get_user_identity_candidates(
             user_id, include_email_alias=False
         )
         if not primary_candidate_ids:
-            return [], {}
+            result: Tuple[List[str], Dict[str, Dict[str, Any]]] = ([], {})
+            return self._cache_set(cache_key, result)
 
         preferred_enrollments = await self._collect_preferred_enrollments_by_course(
             primary_candidate_ids, limit=limit
         )
         if preferred_enrollments:
-            return primary_candidate_ids, preferred_enrollments
+            result = (primary_candidate_ids, preferred_enrollments)
+            return self._cache_set(cache_key, result)
 
         all_candidate_ids = await self._get_user_identity_candidates(
             user_id, include_email_alias=True
@@ -1789,15 +1815,18 @@ class SupabaseDataService:
             if candidate_id not in primary_candidate_ids
         ]
         if not fallback_candidate_ids:
-            return primary_candidate_ids, {}
+            result = (primary_candidate_ids, {})
+            return self._cache_set(cache_key, result)
 
         fallback_enrollments = await self._collect_preferred_enrollments_by_course(
             fallback_candidate_ids, limit=limit
         )
         if not fallback_enrollments:
-            return primary_candidate_ids, {}
+            result = (primary_candidate_ids, {})
+            return self._cache_set(cache_key, result)
 
-        return primary_candidate_ids + fallback_candidate_ids, fallback_enrollments
+        result = (primary_candidate_ids + fallback_candidate_ids, fallback_enrollments)
+        return self._cache_set(cache_key, result)
 
     async def get_user_enrollments_with_aliases(
         self, user_id: str, limit: int = 50
@@ -2037,12 +2066,17 @@ class SupabaseDataService:
         )
 
     async def get_dashboard_learning_inputs(
-        self, user_id: str, limit: int = 50
+        self, user_id: str, limit: int = 50, *, skip_cache: bool = False
     ) -> Dict[str, Any]:
         cache_key = f"dashboard_inputs:{user_id}:{int(limit or 50)}"
-        cached = self._cache_get(cache_key)
-        if cached is not None:
-            return cached
+        if skip_cache:
+            cache = getattr(self, "_read_cache", None)
+            if isinstance(cache, dict):
+                cache.pop(cache_key, None)
+        else:
+            cached = self._cache_get(cache_key)
+            if cached is not None:
+                return cached
 
         (
             candidate_ids,
@@ -2094,6 +2128,7 @@ class SupabaseDataService:
             select=LESSON_SUMMARY_SELECT,
         )
         quizzes_task = self.get_quizzes_for_courses(course_ids, summary=True)
+        quiz_results_limit = min(5000, max(500, len(course_ids) * 100))
         if hasattr(self, "supabase"):
             results_task = self._query(
                 "quiz_results",
@@ -2101,7 +2136,7 @@ class SupabaseDataService:
                 in_filters={"user_id": candidate_ids, "course_id": course_ids},
                 order_by="submitted_at",
                 desc=True,
-                limit=10000,
+                limit=quiz_results_limit,
             )
             courses, lessons, quizzes, quiz_results_payload = await asyncio.gather(
                 courses_task, lessons_task, quizzes_task, results_task
@@ -2116,21 +2151,26 @@ class SupabaseDataService:
                     "quiz_results",
                     "user_id",
                     candidate_ids,
-                    limit=10000,
+                    limit=quiz_results_limit,
                     include_deleted=True,
                 ),
             )
 
+        payload = {
+            "candidate_user_ids": candidate_ids,
+            "enrollments": enrollments,
+            "courses": courses,
+            "lessons": lessons,
+            "quizzes": quizzes,
+            "quiz_results": quiz_results,
+        }
+        if enrollments and not courses:
+            return payload
+
         return self._cache_set(
             cache_key,
-            {
-                "candidate_user_ids": candidate_ids,
-                "enrollments": enrollments,
-                "courses": courses,
-                "lessons": lessons,
-                "quizzes": quizzes,
-                "quiz_results": quiz_results,
-            },
+            payload,
+            ttl=DASHBOARD_CACHE_TTL_SECONDS,
         )
 
     async def get_user_enrollment_for_course(
