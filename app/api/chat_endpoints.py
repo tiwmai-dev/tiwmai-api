@@ -15,7 +15,9 @@ from app.services.student_auth_service import StudentAuthService
 from app.api.student_handlers import (
     STUDENT_BEARER_OPTIONAL,
     _get_student_auth_service,
+    _is_premium_active,
     _require_user_matches_token,
+    get_data_service,
 )
 
 router = APIRouter()
@@ -43,6 +45,7 @@ async def send_chat_message(
     credentials: Optional[HTTPAuthorizationCredentials] = Depends(STUDENT_BEARER_OPTIONAL),
     student_auth_service: StudentAuthService = Depends(_get_student_auth_service),
     chat_service: ChatService = Depends(get_chat_service),
+    data_service=Depends(get_data_service),
 ) -> ChatResponse:
     """Send a message to the AI chat assistant."""
     try:
@@ -63,6 +66,14 @@ async def send_chat_message(
             )
 
         normalized_mode = chat_service.normalize_chat_mode(chat_mode)
+
+        if normalized_mode == "study_solver":
+            user = await data_service.get_user(user_id)
+            if not _is_premium_active(user):
+                raise HTTPException(
+                    status_code=403,
+                    detail="PREMIUM_REQUIRED: AI ช่วยทำโจทย์ระหว่างทำแบบฝึกหัดใช้ได้เฉพาะสมาชิก Premium",
+                )
 
         image_bytes = None
         image_mime = None

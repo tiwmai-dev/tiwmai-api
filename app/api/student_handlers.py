@@ -40,28 +40,35 @@ async def health_check():
         llm_status="configured" if get_settings().openrouter_api_key else "not_configured",
     )
 
-class PromptPayCreateIntentRequest(BaseModel):
+PREMIUM_PLAN_CATALOG: Dict[str, Dict[str, Any]] = {
+    '1m': {'price': 349.0, 'duration_months': 1, 'label': '1 เดือน'},
+    '3m': {'price': 897.0, 'duration_months': 3, 'label': '3 เดือน'},
+    '6m': {'price': 1494.0, 'duration_months': 6, 'label': '6 เดือน'},
+    '12m': {'price': 2388.0, 'duration_months': 12, 'label': '12 เดือน'},
+}
+
+
+class PremiumPromptPayCreateIntentRequest(BaseModel):
     user_id: str
-    course_id: str
+    plan_id: str
     billing_email: Optional[str] = None
-    amount_thb: Optional[float] = None
-    plan_label: Optional[str] = None
-    duration_months: Optional[int] = None
 
 
-class PromptPayCreateIntentResponse(BaseModel):
+class PremiumPromptPayCreateIntentResponse(BaseModel):
     payment_intent_id: str
     client_secret: str
     publishable_key: str
     amount: int
     currency: str
     payment_status: str
-    already_enrolled: bool = False
+    plan_id: str
+    plan_label: str
+    duration_months: int
+    already_subscribed: bool = False
 
 
-class PromptPayConfirmRequest(BaseModel):
+class PremiumPromptPayConfirmRequest(BaseModel):
     user_id: str
-    course_id: str
     payment_intent_id: str
 
 
@@ -113,20 +120,15 @@ async def _stripe_request(method: str, path: str, secret_key: str, data: Optiona
     return payload
 
 
-async def _get_existing_enrollment_with_schedule(data_service, user_id: str, course_id: str) -> Optional[Dict[str, Any]]:
-    enrollment = await _get_user_course_enrollment(data_service=data_service, user_id=user_id, course_id=course_id)
-    if not enrollment:
-        return None
-    schedule = _build_enrollment_schedule(started_at_raw=enrollment.get('started_at') or enrollment.get('enrolled_at'), expires_at_raw=enrollment.get('expires_at'), duration_months_raw=enrollment.get('duration_months'))
-    return {'enrollment': enrollment, 'schedule': schedule}
+async def _get_all_user_enrollments(data_service, user_id: str) -> List[Dict[str, Any]]:
+    get_with_aliases = getattr(data_service, 'get_user_enrollments_with_aliases', None)
+    if callable(get_with_aliases):
+        return await get_with_aliases(user_id)
+    return await data_service.get_user_enrollments(user_id)
 
 
 async def _get_user_course_enrollment(data_service, user_id: str, course_id: str) -> Optional[Dict[str, Any]]:
-    get_with_aliases = getattr(data_service, 'get_user_enrollments_with_aliases', None)
-    if callable(get_with_aliases):
-        enrollments = await get_with_aliases(user_id)
-    else:
-        enrollments = await data_service.get_user_enrollments(user_id)
+    enrollments = await _get_all_user_enrollments(data_service, user_id)
     target_course_id = str(course_id or '').strip()
     for row in enrollments:
         enrolled_course_id = str(row.get('course_id') or row.get('id') or row.get('_id') or '').strip()
@@ -139,19 +141,47 @@ async def _get_user_course_enrollment(data_service, user_id: str, course_id: str
     return None
 
 
+def _is_premium_active(user: Optional[Dict[str, Any]]) -> bool:
+    if not isinstance(user, dict):
+        return False
+    subscription = user.get('premium_subscription')
+    if not isinstance(subscription, dict) or not subscription:
+        return False
+    schedule = _build_enrollment_schedule(started_at_raw=subscription.get('started_at'), expires_at_raw=subscription.get('expires_at'), duration_months_raw=subscription.get('duration_months'))
+    if schedule['is_expired'] or not schedule.get('expires_at'):
+        return False
+    return str(subscription.get('status') or 'active').strip().lower() != 'expired'
+
+
 async def _ensure_active_course_access(data_service, user_id: str, course_id: str) -> Dict[str, Any]:
     normalized_user_id = str(user_id or '').strip()
     normalized_course_id = str(course_id or '').strip()
     if not normalized_user_id or not normalized_course_id:
         raise HTTPException(status_code=400, detail='Missing user_id or course_id for access check')
+    user = await data_service.get_user(normalized_user_id)
+
+    if _is_premium_active(user):
+        enrollment = await _get_user_course_enrollment(data_service=data_service, user_id=normalized_user_id, course_id=normalized_course_id)
+        if not enrollment:
+            lazy_enrollment_data = {'progress': 0, 'completed_quizzes': 0, 'total_quizzes': 0, 'completed_questions': 0, 'total_questions': 0, 'last_activity': 'เพิ่งเข้าร่วมด้วยสิทธิ์ Premium', 'enrollment_source': 'premium', 'enrollment_type': 'premium'}
+            await data_service.enroll_user_in_course(normalized_user_id, normalized_course_id, lazy_enrollment_data)
+            enrollment = await _get_user_course_enrollment(data_service=data_service, user_id=normalized_user_id, course_id=normalized_course_id) or lazy_enrollment_data
+        schedule = _build_enrollment_schedule(started_at_raw=enrollment.get('started_at') or enrollment.get('enrolled_at'), expires_at_raw=None, duration_months_raw=None)
+        return {'enrollment': enrollment, 'schedule': schedule}
+
     enrollment = await _get_user_course_enrollment(data_service=data_service, user_id=normalized_user_id, course_id=normalized_course_id)
-    if not enrollment:
-        raise HTTPException(status_code=403, detail='COURSE_ACCESS_DENIED: not enrolled in this course')
-    schedule = _build_enrollment_schedule(started_at_raw=enrollment.get('started_at') or enrollment.get('enrolled_at'), expires_at_raw=enrollment.get('expires_at'), duration_months_raw=enrollment.get('duration_months'))
-    if schedule['is_expired']:
-        expired_at = schedule.get('expires_at') or 'unknown'
-        raise HTTPException(status_code=403, detail=f'COURSE_EXPIRED: enrollment expired on {expired_at}')
-    return {'enrollment': enrollment, 'schedule': schedule}
+    if enrollment and _is_free_course_enrollment(enrollment):
+        schedule = _build_enrollment_schedule(started_at_raw=enrollment.get('started_at') or enrollment.get('enrolled_at'), expires_at_raw=None, duration_months_raw=None)
+        return {'enrollment': enrollment, 'schedule': schedule}
+    if enrollment:
+        raise HTTPException(status_code=403, detail='PREMIUM_REQUIRED: your Premium subscription is required to access this course')
+
+    all_enrollments = await _get_all_user_enrollments(data_service, normalized_user_id)
+    claimed_free_enrollment = next((row for row in all_enrollments if _is_free_course_enrollment(row)), None)
+    if claimed_free_enrollment:
+        claimed_course_id = str(claimed_free_enrollment.get('course_id') or '').strip()
+        raise HTTPException(status_code=403, detail=f'FREE_COURSE_LIMIT: your free course is {claimed_course_id}; upgrade to Premium for full access')
+    raise HTTPException(status_code=403, detail='COURSE_ACCESS_DENIED: not enrolled in this course')
 
 
 async def _ensure_user_matches_token(user_id: Optional[str], credentials: Optional[HTTPAuthorizationCredentials], auth_service: StudentAuthService) -> None:
@@ -226,11 +256,11 @@ def _build_enrollment_schedule(started_at_raw: Any, expires_at_raw: Any, duratio
     return {'started_at': _format_utc_iso(started_dt), 'expires_at': _format_utc_iso(expires_dt), 'duration_months': duration_months, 'is_expired': is_expired, 'days_remaining': days_remaining}
 
 
-def _is_trial_enrollment(enrollment: Dict[str, Any]) -> bool:
+def _is_free_course_enrollment(enrollment: Dict[str, Any]) -> bool:
     source = str(enrollment.get('enrollment_source') or enrollment.get('enrollment_type') or '').strip().lower()
-    if source == 'trial':
+    if source == 'free':
         return True
-    return any((bool(enrollment.get(field)) for field in ('trial_consumed_at', 'trial_expires_at')))
+    return bool(enrollment.get('free_course_claimed_at'))
 
 
 def _coerce_number(*values: Any) -> float:
@@ -409,8 +439,7 @@ def _merge_course_with_enrollment(course: Dict[str, Any], enrollment: Dict[str, 
     row['plan_label'] = enrollment.get('plan_label')
     row['paid_at'] = enrollment.get('paid_at')
     row['payment_history'] = enrollment.get('payment_history')
-    row['trial_consumed_at'] = enrollment.get('trial_consumed_at')
-    row['trial_expires_at'] = enrollment.get('trial_expires_at')
+    row['free_course_claimed_at'] = enrollment.get('free_course_claimed_at')
     row['progress'] = enrollment.get('progress', row.get('progress', 0))
     row['completed_quizzes'] = enrollment.get('completed_quizzes', row.get('completed_quizzes', 0))
     row['total_quizzes'] = enrollment.get('total_quizzes', row.get('total_quizzes', 0))
@@ -423,7 +452,7 @@ def _merge_course_with_enrollment(course: Dict[str, Any], enrollment: Dict[str, 
 
 def _format_student_course(course: Dict[str, Any]) -> Dict[str, Any]:
     schedule = _build_enrollment_schedule(started_at_raw=course.get('started_at') or course.get('enrolled_at'), expires_at_raw=course.get('expires_at'), duration_months_raw=course.get('duration_months'))
-    return {'id': course.get('course_id'), 'name': course.get('name'), 'description': course.get('description'), 'detail': course.get('detail'), 'target_profile': course.get('target_profile'), 'structure_summary': course.get('structure_summary'), 'topics': course.get('topics', []), 'tags': course.get('tags', []), 'course_tags': course.get('tags', []), 'benefits': course.get('benefits', []), 'content_items': course.get('content_items', []), 'instructor': course.get('instructor') or course.get('teacher_name') or 'อาจารย์ระบบ', 'teacher_name': course.get('teacher_name') or course.get('instructor') or 'อาจารย์ระบบ', 'category': course.get('category', 'ทั่วไป'), 'progress': course.get('progress', 0), 'totalQuizzes': course.get('total_quizzes', 0), 'completedQuizzes': course.get('completed_quizzes', 0), 'totalQuestions': course.get('total_questions', 0), 'completedQuestions': course.get('completed_questions', 0), 'lastActivity': course.get('last_activity', 'เพิ่งเข้าร่วม'), 'color': '#4ecdc4', 'image': '📚', 'image_url': course.get('image_url'), 'thumbnail_url': course.get('thumbnail_url'), 'preview_image_url': course.get('preview_image_url'), 'purchase_preview_image_url': course.get('purchase_preview_image_url'), 'price': course.get('price'), 'enrollment_id': course.get('enrollment_id'), 'enrolled_at': course.get('enrolled_at'), 'started_at': schedule['started_at'], 'expires_at': schedule['expires_at'], 'duration_months': schedule['duration_months'], 'is_expired': schedule['is_expired'], 'days_remaining': schedule['days_remaining'], 'enrollment_source': course.get('enrollment_source'), 'enrollment_type': course.get('enrollment_type'), 'trial_consumed_at': course.get('trial_consumed_at'), 'trial_expires_at': course.get('trial_expires_at'), 'is_trial': _is_trial_enrollment(course)}
+    return {'id': course.get('course_id'), 'name': course.get('name'), 'description': course.get('description'), 'detail': course.get('detail'), 'target_profile': course.get('target_profile'), 'structure_summary': course.get('structure_summary'), 'topics': course.get('topics', []), 'tags': course.get('tags', []), 'course_tags': course.get('tags', []), 'benefits': course.get('benefits', []), 'content_items': course.get('content_items', []), 'instructor': course.get('instructor') or course.get('teacher_name') or 'อาจารย์ระบบ', 'teacher_name': course.get('teacher_name') or course.get('instructor') or 'อาจารย์ระบบ', 'category': course.get('category', 'ทั่วไป'), 'progress': course.get('progress', 0), 'totalQuizzes': course.get('total_quizzes', 0), 'completedQuizzes': course.get('completed_quizzes', 0), 'totalQuestions': course.get('total_questions', 0), 'completedQuestions': course.get('completed_questions', 0), 'lastActivity': course.get('last_activity', 'เพิ่งเข้าร่วม'), 'color': '#4ecdc4', 'image': '📚', 'image_url': course.get('image_url'), 'thumbnail_url': course.get('thumbnail_url'), 'preview_image_url': course.get('preview_image_url'), 'purchase_preview_image_url': course.get('purchase_preview_image_url'), 'price': course.get('price'), 'enrollment_id': course.get('enrollment_id'), 'enrolled_at': course.get('enrolled_at'), 'started_at': schedule['started_at'], 'expires_at': schedule['expires_at'], 'duration_months': schedule['duration_months'], 'is_expired': schedule['is_expired'], 'days_remaining': schedule['days_remaining'], 'enrollment_source': course.get('enrollment_source'), 'enrollment_type': course.get('enrollment_type'), 'free_course_claimed_at': course.get('free_course_claimed_at'), 'is_free_course': _is_free_course_enrollment(course)}
 
 
 def _build_dashboard_course_stats(courses: List[Dict[str, Any]], lessons: List[Dict[str, Any]], quizzes: List[Dict[str, Any]], quiz_results: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
@@ -839,7 +868,35 @@ def _paid_at_from_intent(intent: Dict[str, Any]) -> str:
     return paid_at
 
 
-async def _complete_promptpay_payment(*, payment_intent_id: str, data_service, expected_user_id: Optional[str]=None, expected_course_id: Optional[str]=None) -> Dict[str, Any]:
+def _resolve_premium_plan(plan_id: str) -> Dict[str, Any]:
+    normalized_plan_id = str(plan_id or '').strip()
+    plan = PREMIUM_PLAN_CATALOG.get(normalized_plan_id)
+    if not plan:
+        raise HTTPException(status_code=400, detail='Invalid premium plan_id')
+    return {'id': normalized_plan_id, **plan}
+
+
+def _build_premium_subscription_response(user_id: str, subscription: Dict[str, Any]) -> Dict[str, Any]:
+    schedule = _build_enrollment_schedule(started_at_raw=subscription.get('started_at'), expires_at_raw=subscription.get('expires_at'), duration_months_raw=subscription.get('duration_months'))
+    expires_dt = _parse_iso_datetime(schedule.get('expires_at'))
+    now = datetime.utcnow()
+    remaining_seconds = None
+    if expires_dt:
+        remaining_seconds = max(0, int((expires_dt - now).total_seconds()))
+    is_active = bool(expires_dt and expires_dt >= now and str(subscription.get('status') or 'active').strip().lower() != 'expired')
+    return {'user_id': user_id, 'is_active': is_active, 'plan_id': subscription.get('plan_id'), 'plan_label': subscription.get('plan_label'), 'duration_months': schedule.get('duration_months'), 'started_at': schedule.get('started_at'), 'expires_at': schedule.get('expires_at'), 'is_expired': schedule.get('is_expired'), 'days_remaining': schedule.get('days_remaining'), 'remaining_seconds': remaining_seconds}
+
+
+async def _get_premium_subscription_state(*, data_service, user_id: str) -> Dict[str, Any]:
+    user = await data_service.get_user(user_id)
+    if not user:
+        raise HTTPException(status_code=404, detail='User not found')
+    subscription = user.get('premium_subscription') if isinstance(user.get('premium_subscription'), dict) else {}
+    schedule = _build_enrollment_schedule(started_at_raw=subscription.get('started_at'), expires_at_raw=subscription.get('expires_at'), duration_months_raw=subscription.get('duration_months'))
+    return {'user': user, 'subscription': subscription, 'schedule': schedule}
+
+
+async def _complete_premium_promptpay_payment(*, payment_intent_id: str, data_service, expected_user_id: Optional[str]=None) -> Dict[str, Any]:
     settings = get_settings()
     if not settings.stripe_private_key:
         raise HTTPException(status_code=500, detail='Stripe private key is not configured')
@@ -849,53 +906,56 @@ async def _complete_promptpay_payment(*, payment_intent_id: str, data_service, e
     intent = await _stripe_request(method='GET', path=f'/payment_intents/{payment_intent_id}', secret_key=settings.stripe_private_key, params={'expand[]': 'latest_charge'})
     metadata = intent.get('metadata') if isinstance(intent.get('metadata'), dict) else {}
     user_id = str(metadata.get('user_id') or expected_user_id or '').strip()
-    course_id = str(metadata.get('course_id') or expected_course_id or '').strip()
-    if not user_id or not course_id:
-        raise HTTPException(status_code=400, detail='Payment is missing required user or course metadata')
+    plan_id = str(metadata.get('plan_id') or '').strip()
+    payment_type = str(metadata.get('payment_type') or '').strip()
+    if not user_id:
+        raise HTTPException(status_code=400, detail='Payment is missing required user metadata')
     if expected_user_id and user_id != str(expected_user_id).strip():
         raise HTTPException(status_code=400, detail='Payment does not belong to this user')
-    if expected_course_id and course_id != str(expected_course_id).strip():
-        raise HTTPException(status_code=400, detail='Payment does not belong to this course')
+    if payment_type and payment_type != 'premium_subscription':
+        raise HTTPException(status_code=400, detail='Payment is not a premium subscription')
+    if not plan_id:
+        plan_id = str(metadata.get('plan_label') or '').strip()
+    plan = _resolve_premium_plan(plan_id) if plan_id in PREMIUM_PLAN_CATALOG else None
+    if not plan:
+        duration_months = _parse_positive_int(metadata.get('duration_months'))
+        plan = {'id': plan_id or 'custom', 'label': str(metadata.get('plan_label') or '').strip() or 'Premium', 'duration_months': duration_months or 1, 'price': _payment_amount_thb_from_intent(intent) or 0.0}
     payment_status = str(intent.get('status') or '').strip()
     if payment_status != 'succeeded':
-        return {'payment_intent_id': payment_intent_id, 'payment_status': payment_status or 'unknown', 'enrolled': False, 'message': 'Payment is not completed yet'}
-    existing_enrollment_with_schedule = await _get_existing_enrollment_with_schedule(data_service=data_service, user_id=user_id, course_id=course_id)
+        return {'payment_intent_id': payment_intent_id, 'payment_status': payment_status or 'unknown', 'activated': False, 'message': 'Payment is not completed yet'}
+    state = await _get_premium_subscription_state(data_service=data_service, user_id=user_id)
+    existing_subscription = state.get('subscription') or {}
+    payment_history = _normalize_payment_history(existing_subscription)
+    existing_payment_event = _find_payment_event_by_intent(payment_events=payment_history, payment_intent_id=payment_intent_id)
+    if existing_payment_event:
+        response = _build_premium_subscription_response(user_id, existing_subscription)
+        return {'payment_intent_id': payment_intent_id, 'order_id': existing_payment_event.get('order_id') or _build_payment_order_id(existing_payment_event.get('paid_at'), payment_intent_id), 'receipt_url': existing_payment_event.get('receipt_url'), 'payment_status': payment_status, 'activated': True, 'plan_id': response.get('plan_id'), 'plan_label': response.get('plan_label'), 'expires_at': response.get('expires_at'), 'started_at': response.get('started_at'), 'days_remaining': response.get('days_remaining'), 'remaining_seconds': response.get('remaining_seconds'), 'message': 'Payment already confirmed for this premium subscription'}
     paid_at = _paid_at_from_intent(intent)
     latest_charge = _latest_charge_from_intent(intent)
     stripe_charge_id = str(latest_charge.get('id') or '').strip() or None
     receipt_number = str(latest_charge.get('receipt_number') or '').strip() or None
     receipt_url = str(latest_charge.get('receipt_url') or '').strip() or None
-    duration_months = _parse_positive_int(metadata.get('duration_months'))
-    schedule = _build_enrollment_schedule(started_at_raw=paid_at, expires_at_raw=None, duration_months_raw=duration_months)
-    enrollment_data = {'progress': 0, 'completed_quizzes': 0, 'total_quizzes': 0, 'completed_questions': 0, 'total_questions': 0, 'last_activity': 'เพิ่งชำระเงินและเข้าร่วม', 'enrollment_source': 'payment', 'order_id': _build_payment_order_id(paid_at, payment_intent_id), 'payment_provider': 'stripe', 'payment_type': 'promptpay', 'payment_intent_id': payment_intent_id, 'stripe_charge_id': stripe_charge_id, 'receipt_number': receipt_number, 'receipt_url': receipt_url, 'payment_status': payment_status, 'paid_amount_thb': _payment_amount_thb_from_intent(intent), 'paid_currency': str(intent.get('currency') or 'THB').upper(), 'billing_email': str(intent.get('receipt_email') or '').strip(), 'plan_label': str(metadata.get('plan_label') or '').strip(), 'duration_months': duration_months, 'paid_at': paid_at, 'started_at': schedule['started_at'], 'expires_at': schedule['expires_at']}
-    if existing_enrollment_with_schedule:
-        existing_enrollment = existing_enrollment_with_schedule['enrollment']
-        enrollment_id = str(existing_enrollment.get('enrollment_id') or '').strip()
-        if not enrollment_id:
-            raise HTTPException(status_code=500, detail='Existing enrollment is missing enrollment_id')
-        payment_history = _normalize_payment_history(existing_enrollment)
-        existing_payment_event = _find_payment_event_by_intent(payment_events=payment_history, payment_intent_id=payment_intent_id)
-        if existing_payment_event:
-            return {'payment_intent_id': payment_intent_id, 'order_id': existing_payment_event.get('order_id') or _build_payment_order_id(existing_payment_event.get('paid_at'), payment_intent_id), 'receipt_url': existing_payment_event.get('receipt_url'), 'payment_status': payment_status, 'enrolled': True, 'enrollment_id': enrollment_id, 'message': 'Payment already confirmed for this enrollment'}
-        current_schedule = existing_enrollment_with_schedule.get('schedule') or {}
-        current_expires_at = _parse_iso_datetime(current_schedule.get('expires_at'))
-        paid_at_dt = _parse_iso_datetime(paid_at) or datetime.utcnow()
-        renewal_start_dt = paid_at_dt
-        if current_expires_at and current_expires_at > paid_at_dt:
-            renewal_start_dt = current_expires_at
-        renewal_schedule = _build_enrollment_schedule(started_at_raw=renewal_start_dt.isoformat(), expires_at_raw=None, duration_months_raw=duration_months)
-        enrollment_data['started_at'] = renewal_schedule['started_at']
-        enrollment_data['expires_at'] = renewal_schedule['expires_at']
-        payment_event = _to_payment_event(enrollment_data)
-        payment_history.append(payment_event)
-        renewal_updates = {'status': 'active', 'order_id': enrollment_data['order_id'], 'payment_provider': enrollment_data['payment_provider'], 'payment_type': enrollment_data['payment_type'], 'payment_intent_id': enrollment_data['payment_intent_id'], 'stripe_charge_id': enrollment_data['stripe_charge_id'], 'receipt_number': enrollment_data['receipt_number'], 'receipt_url': enrollment_data['receipt_url'], 'payment_status': enrollment_data['payment_status'], 'paid_amount_thb': enrollment_data['paid_amount_thb'], 'paid_currency': enrollment_data['paid_currency'], 'billing_email': enrollment_data['billing_email'], 'plan_label': enrollment_data['plan_label'], 'duration_months': enrollment_data['duration_months'], 'paid_at': enrollment_data['paid_at'], 'started_at': enrollment_data['started_at'], 'expires_at': enrollment_data['expires_at'], 'payment_history': payment_history, 'last_activity': 'ต่ออายุคอร์สแล้ว'}
-        success = await data_service.update_enrollment(enrollment_id, renewal_updates)
-        if not success:
-            raise HTTPException(status_code=500, detail='Failed to renew existing enrollment')
-        return {'payment_intent_id': payment_intent_id, 'order_id': payment_event.get('order_id'), 'receipt_url': payment_event.get('receipt_url'), 'payment_status': payment_status, 'enrolled': True, 'enrollment_id': enrollment_id, 'message': 'Payment verified and enrollment renewed'}
-    payment_event = _to_payment_event(enrollment_data)
-    enrollment_id = await data_service.enroll_user_in_course(user_id=user_id, course_id=course_id, enrollment_data={**enrollment_data, 'payment_history': [payment_event]})
-    return {'payment_intent_id': payment_intent_id, 'order_id': payment_event.get('order_id'), 'receipt_url': payment_event.get('receipt_url'), 'payment_status': payment_status, 'enrolled': True, 'enrollment_id': enrollment_id, 'message': 'Payment verified and enrollment completed'}
+    duration_months = _parse_positive_int(metadata.get('duration_months')) or int(plan.get('duration_months') or 1)
+    paid_at_dt = _parse_iso_datetime(paid_at) or datetime.utcnow()
+    current_schedule = state.get('schedule') or {}
+    current_expires_at = _parse_iso_datetime(current_schedule.get('expires_at'))
+    renewal_start_dt = paid_at_dt
+    if current_expires_at and current_expires_at > paid_at_dt:
+        renewal_start_dt = current_expires_at
+    renewal_schedule = _build_enrollment_schedule(started_at_raw=renewal_start_dt.isoformat(), expires_at_raw=None, duration_months_raw=duration_months)
+    subscription_data = {'status': 'active', 'plan_id': plan.get('id'), 'plan_label': str(metadata.get('plan_label') or plan.get('label') or '').strip(), 'duration_months': duration_months, 'order_id': _build_payment_order_id(paid_at, payment_intent_id), 'payment_provider': 'stripe', 'payment_type': 'promptpay', 'payment_intent_id': payment_intent_id, 'stripe_charge_id': stripe_charge_id, 'receipt_number': receipt_number, 'receipt_url': receipt_url, 'payment_status': payment_status, 'paid_amount_thb': _payment_amount_thb_from_intent(intent), 'paid_currency': str(intent.get('currency') or 'THB').upper(), 'billing_email': str(intent.get('receipt_email') or '').strip(), 'paid_at': paid_at, 'started_at': renewal_schedule['started_at'], 'expires_at': renewal_schedule['expires_at']}
+    payment_event = _to_payment_event(subscription_data)
+    payment_history.append(payment_event)
+    subscription_data['payment_history'] = payment_history
+    save_premium = getattr(data_service, 'save_premium_subscription', None)
+    if not callable(save_premium):
+        raise HTTPException(status_code=500, detail='Premium subscription storage is not configured')
+    try:
+        await save_premium(user_id, subscription_data)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    response = _build_premium_subscription_response(user_id, subscription_data)
+    return {'payment_intent_id': payment_intent_id, 'order_id': payment_event.get('order_id'), 'receipt_url': payment_event.get('receipt_url'), 'payment_status': payment_status, 'activated': True, 'plan_id': response.get('plan_id'), 'plan_label': response.get('plan_label'), 'expires_at': response.get('expires_at'), 'started_at': response.get('started_at'), 'days_remaining': response.get('days_remaining'), 'remaining_seconds': response.get('remaining_seconds'), 'message': 'Payment verified and premium subscription activated'}
 
 
 async def get_data_service():
@@ -1307,75 +1367,65 @@ async def list_all_courses(data_service=Depends(get_data_service)):
         raise HTTPException(status_code=500, detail='Failed to list courses')
 
 
-async def create_promptpay_payment_intent(body: PromptPayCreateIntentRequest, credentials: Optional[HTTPAuthorizationCredentials]=Depends(STUDENT_BEARER_OPTIONAL), student_auth_service: StudentAuthService=Depends(_get_student_auth_service), data_service=Depends(get_data_service)):
-    """Create a Stripe PromptPay PaymentIntent for a course purchase."""
+async def create_premium_promptpay_payment_intent(body: PremiumPromptPayCreateIntentRequest, credentials: Optional[HTTPAuthorizationCredentials]=Depends(STUDENT_BEARER_OPTIONAL), student_auth_service: StudentAuthService=Depends(_get_student_auth_service), data_service=Depends(get_data_service)):
+    """Create a Stripe PromptPay PaymentIntent for a Premium subscription."""
     user_id = str(body.user_id or '').strip()
-    course_id = str(body.course_id or '').strip()
-    if not user_id or not course_id:
-        raise HTTPException(status_code=400, detail='user_id and course_id are required')
+    plan_id = str(body.plan_id or '').strip()
+    if not user_id or not plan_id:
+        raise HTTPException(status_code=400, detail='user_id and plan_id are required')
     await _require_user_matches_token(user_id=user_id, credentials=credentials, auth_service=student_auth_service)
+    plan = _resolve_premium_plan(plan_id)
     settings = get_settings()
     if not settings.stripe_private_key or not settings.stripe_public_key:
         raise HTTPException(status_code=500, detail='Stripe keys are not configured (STRIPE_PRIVATE_KEY / STRIPE_PUBLIC_KEY)')
-    course = await data_service.get_course(course_id)
-    if not course:
-        raise HTTPException(status_code=404, detail='Course not found')
-    existing_enrollment_with_schedule = await _get_existing_enrollment_with_schedule(data_service=data_service, user_id=user_id, course_id=course_id)
-    has_existing_active_enrollment = bool(existing_enrollment_with_schedule and (not existing_enrollment_with_schedule['schedule']['is_expired']))
-    allowed_prices: List[float] = []
-    base_price_raw = course.get('price')
-    try:
-        base_price = float(base_price_raw or 0)
-    except Exception:
-        base_price = 0.0
-    if base_price > 0:
-        allowed_prices.append(round(base_price, 2))
-    pricing_plans = course.get('pricing_plans')
-    if isinstance(pricing_plans, list):
-        for plan in pricing_plans:
-            if not isinstance(plan, dict):
-                continue
-            try:
-                p = float(plan.get('price', 0))
-            except Exception:
-                p = 0.0
-            if p > 0:
-                allowed_prices.append(round(p, 2))
-    unique_allowed_prices = sorted(set(allowed_prices))
-    requested_amount = body.amount_thb
-    if requested_amount is None:
-        amount_thb = unique_allowed_prices[0] if unique_allowed_prices else 0.0
-    else:
-        try:
-            amount_thb = round(float(requested_amount), 2)
-        except Exception:
-            raise HTTPException(status_code=400, detail='Invalid amount_thb')
-        if unique_allowed_prices and amount_thb not in unique_allowed_prices:
-            raise HTTPException(status_code=400, detail='Selected amount does not match course pricing')
-    if amount_thb <= 0:
-        raise HTTPException(status_code=400, detail='This course is free, please enroll directly without payment')
+    user = await data_service.get_user(user_id)
+    if not user:
+        raise HTTPException(status_code=404, detail='User not found')
+    subscription = user.get('premium_subscription') if isinstance(user.get('premium_subscription'), dict) else {}
+    schedule = _build_enrollment_schedule(started_at_raw=subscription.get('started_at'), expires_at_raw=subscription.get('expires_at'), duration_months_raw=subscription.get('duration_months'))
+    has_active_subscription = bool(subscription and (not schedule.get('is_expired')))
+    amount_thb = round(float(plan['price']), 2)
     amount_satang = int(round(amount_thb * 100))
     if amount_satang < 100:
         raise HTTPException(status_code=400, detail='Amount is too low for payment')
-    course_name = str(course.get('name') or course.get('title') or 'คอร์สเรียน').strip()
-    stripe_payload = {'amount': str(amount_satang), 'currency': 'thb', 'payment_method_types[]': 'promptpay', 'description': f'Course payment: {course_name}', 'metadata[user_id]': user_id, 'metadata[course_id]': course_id, 'metadata[payment_type]': 'course_enrollment', 'metadata[plan_label]': str(body.plan_label or '').strip(), 'metadata[duration_months]': str(body.duration_months or '')}
+    stripe_payload = {'amount': str(amount_satang), 'currency': 'thb', 'payment_method_types[]': 'promptpay', 'description': f'Premium subscription: {plan["label"]}', 'metadata[user_id]': user_id, 'metadata[payment_type]': 'premium_subscription', 'metadata[plan_id]': plan['id'], 'metadata[plan_label]': str(plan['label']).strip(), 'metadata[duration_months]': str(plan['duration_months'])}
+    billing_email = str(body.billing_email or '').strip()
+    if billing_email:
+        stripe_payload['receipt_email'] = billing_email
     intent = await _stripe_request(method='POST', path='/payment_intents', secret_key=settings.stripe_private_key, data=stripe_payload)
     payment_intent_id = str(intent.get('id') or '').strip()
     client_secret = str(intent.get('client_secret') or '').strip()
     if not payment_intent_id or not client_secret:
         raise HTTPException(status_code=500, detail='Failed to create payment intent')
-    return PromptPayCreateIntentResponse(payment_intent_id=payment_intent_id, client_secret=client_secret, publishable_key=settings.stripe_public_key, amount=amount_satang, currency=str(intent.get('currency') or 'thb').upper(), payment_status=str(intent.get('status') or 'requires_payment_method'), already_enrolled=has_existing_active_enrollment)
+    return PremiumPromptPayCreateIntentResponse(payment_intent_id=payment_intent_id, client_secret=client_secret, publishable_key=settings.stripe_public_key, amount=amount_satang, currency=str(intent.get('currency') or 'thb').upper(), payment_status=str(intent.get('status') or 'requires_payment_method'), plan_id=plan['id'], plan_label=str(plan['label']).strip(), duration_months=int(plan['duration_months']), already_subscribed=has_active_subscription)
 
 
-async def confirm_promptpay_payment_and_enroll(body: PromptPayConfirmRequest, credentials: Optional[HTTPAuthorizationCredentials]=Depends(STUDENT_BEARER_OPTIONAL), student_auth_service: StudentAuthService=Depends(_get_student_auth_service), data_service=Depends(get_data_service)):
-    """Verify payment status from Stripe and enroll the user when payment succeeds."""
+async def confirm_premium_promptpay_payment(body: PremiumPromptPayConfirmRequest, credentials: Optional[HTTPAuthorizationCredentials]=Depends(STUDENT_BEARER_OPTIONAL), student_auth_service: StudentAuthService=Depends(_get_student_auth_service), data_service=Depends(get_data_service)):
+    """Verify Premium PromptPay payment status and activate subscription when payment succeeds."""
     user_id = str(body.user_id or '').strip()
-    course_id = str(body.course_id or '').strip()
     payment_intent_id = str(body.payment_intent_id or '').strip()
-    if not user_id or not course_id or (not payment_intent_id):
-        raise HTTPException(status_code=400, detail='user_id, course_id, and payment_intent_id are required')
+    if not user_id or not payment_intent_id:
+        raise HTTPException(status_code=400, detail='user_id and payment_intent_id are required')
     await _require_user_matches_token(user_id=user_id, credentials=credentials, auth_service=student_auth_service)
-    return await _complete_promptpay_payment(payment_intent_id=payment_intent_id, data_service=data_service, expected_user_id=user_id, expected_course_id=course_id)
+    return await _complete_premium_promptpay_payment(payment_intent_id=payment_intent_id, data_service=data_service, expected_user_id=user_id)
+
+
+async def get_user_premium_subscription(user_id: str, credentials: Optional[HTTPAuthorizationCredentials]=Depends(STUDENT_BEARER_OPTIONAL), student_auth_service: StudentAuthService=Depends(_get_student_auth_service), data_service=Depends(get_data_service)):
+    """Return current Premium subscription status for a student."""
+    try:
+        await _require_user_matches_token(user_id=user_id, credentials=credentials, auth_service=student_auth_service)
+        user = await data_service.get_user(user_id)
+        if not user:
+            raise HTTPException(status_code=404, detail='User not found')
+        subscription = user.get('premium_subscription') if isinstance(user.get('premium_subscription'), dict) else {}
+        if not subscription:
+            return {'user_id': user_id, 'is_active': False, 'plan_id': None, 'plan_label': None, 'duration_months': None, 'started_at': None, 'expires_at': None, 'is_expired': True, 'days_remaining': 0, 'remaining_seconds': 0}
+        return _build_premium_subscription_response(user_id, subscription)
+    except HTTPException:
+        raise
+    except Exception as e:
+        app_logger.error(f'Error fetching premium subscription for {user_id}: {e}')
+        raise HTTPException(status_code=500, detail='Failed to get premium subscription')
 
 
 async def handle_stripe_payment_webhook(request: Request, stripe_signature: Optional[str]=Header(default=None, alias='Stripe-Signature'), data_service=Depends(get_data_service)):
@@ -1398,7 +1448,10 @@ async def handle_stripe_payment_webhook(request: Request, stripe_signature: Opti
         payment_intent_id = str(obj.get('id') or '').strip()
         if not payment_intent_id:
             raise HTTPException(status_code=400, detail='Missing payment intent id in webhook')
-        await _complete_promptpay_payment(payment_intent_id=payment_intent_id, data_service=data_service)
+        metadata = obj.get('metadata') if isinstance(obj.get('metadata'), dict) else {}
+        payment_type = str(metadata.get('payment_type') or '').strip()
+        if payment_type == 'premium_subscription':
+            await _complete_premium_promptpay_payment(payment_intent_id=payment_intent_id, data_service=data_service)
     return {'received': True}
 
 
@@ -1451,49 +1504,72 @@ async def get_student_chat_energy_status(user_id: str, credentials: Optional[HTT
 
 
 async def enroll_user_in_course(user_id: str=Form(...), course_id: str=Form(...), enrollment_mode: str=Form('standard'), progress: int=Form(0), completed_quizzes: int=Form(0), total_quizzes: int=Form(0), completed_questions: int=Form(0), total_questions: int=Form(0), data_service=Depends(get_data_service)):
-    """Enroll a user in a course."""
+    """Enroll a user in a course. mode='free' claims the user's single permanent free course."""
     try:
         app_logger.info(f'Enrolling user {user_id} in course {course_id}')
         enrollment_mode_normalized = str(enrollment_mode or 'standard').strip().lower()
-        if enrollment_mode_normalized not in {'standard', 'trial'}:
-            raise HTTPException(status_code=400, detail="enrollment_mode must be either 'standard' or 'trial'")
+        if enrollment_mode_normalized not in {'standard', 'free'}:
+            raise HTTPException(status_code=400, detail="enrollment_mode must be either 'standard' or 'free'")
         course = await data_service.get_course(course_id)
         if not course:
             raise HTTPException(status_code=404, detail=f'Course {course_id} not found')
         get_user = getattr(data_service, 'get_user', None)
         user_data = await get_user(user_id) if callable(get_user) else None
-        trial_override = _extract_trial_override(user_data or {})
-        reset_trial_override_after_enroll = False
-        if enrollment_mode_normalized == 'trial':
+        free_course_override = _extract_trial_override(user_data or {})
+        reset_override_after_enroll = False
+        if enrollment_mode_normalized == 'free':
             existing_enrollment = await _get_user_course_enrollment(data_service=data_service, user_id=user_id, course_id=course_id)
+            if existing_enrollment and _is_free_course_enrollment(existing_enrollment):
+                schedule = _build_enrollment_schedule(started_at_raw=existing_enrollment.get('started_at') or existing_enrollment.get('enrolled_at'), expires_at_raw=None, duration_months_raw=None)
+                return {'message': 'Free course already claimed', 'enrollment_id': existing_enrollment.get('enrollment_id'), 'user_id': user_id, 'course_id': course_id, 'enrollment_mode': 'free', 'is_free_course': True, 'expires_at': None}
+            all_enrollments = await _get_all_user_enrollments(data_service, user_id)
+            free_used_from_enrollments = any((_is_free_course_enrollment(enrollment) for enrollment in all_enrollments))
+            effective_free = _resolve_effective_trial_used(trial_used_from_enrollments=free_used_from_enrollments, override_mode=free_course_override.get('mode'))
+            if bool(effective_free.get('trial_used')):
+                if str(effective_free.get('trial_status_source')) == 'admin_override':
+                    raise HTTPException(status_code=400, detail='FREE_COURSE_ALREADY_CLAIMED: blocked by admin override mode=used')
+                other_free_enrollment = next((enrollment for enrollment in all_enrollments if _is_free_course_enrollment(enrollment)), None)
+                other_course_id = str((other_free_enrollment or {}).get('course_id') or '').strip()
+                raise HTTPException(status_code=400, detail=f'FREE_COURSE_ALREADY_CLAIMED: you already claimed {other_course_id} as your free course')
+            reset_override_after_enroll = str(free_course_override.get('mode') or '').strip() == 'available'
             if existing_enrollment:
-                raise HTTPException(status_code=400, detail='TRIAL_NOT_ALLOWED: user already has enrollment for this course')
-            user_enrollments = await data_service.get_user_enrollments(user_id)
-            trial_used_from_enrollments = any((_is_trial_enrollment(enrollment) for enrollment in user_enrollments))
-            effective_trial = _resolve_effective_trial_used(trial_used_from_enrollments=trial_used_from_enrollments, override_mode=trial_override.get('mode'))
-            if bool(effective_trial.get('trial_used')):
-                if str(effective_trial.get('trial_status_source')) == 'admin_override':
-                    raise HTTPException(status_code=400, detail='TRIAL_ALREADY_USED: blocked by admin override mode=used')
-                raise HTTPException(status_code=400, detail='TRIAL_ALREADY_USED: each user can only use trial once')
-            reset_trial_override_after_enroll = str(trial_override.get('mode') or '').strip() == 'available'
-        now = datetime.utcnow()
-        trial_started_at = now.isoformat()
-        trial_expires_at = None
-        if enrollment_mode_normalized == 'trial':
-            trial_expires_at = (now + timedelta(days=1)).isoformat()
-        schedule = _build_enrollment_schedule(started_at_raw=trial_started_at, expires_at_raw=trial_expires_at, duration_months_raw=None)
-        default_last_activity = 'เริ่มทดลองเรียน' if enrollment_mode_normalized == 'trial' else 'เพิ่งเข้าร่วม'
-        enrollment_data = {'progress': progress, 'completed_quizzes': completed_quizzes, 'total_quizzes': total_quizzes, 'completed_questions': completed_questions, 'total_questions': total_questions, 'last_activity': f'{completed_questions}/{total_questions} คำถาม' if total_questions > 0 else default_last_activity, 'started_at': schedule['started_at'], 'expires_at': schedule['expires_at'], 'enrollment_source': 'trial' if enrollment_mode_normalized == 'trial' else 'manual', 'enrollment_type': enrollment_mode_normalized}
-        if enrollment_mode_normalized == 'trial':
-            enrollment_data['trial_consumed_at'] = trial_started_at
-            enrollment_data['trial_expires_at'] = schedule['expires_at']
+                if _is_premium_active(user_data):
+                    raise HTTPException(status_code=400, detail='FREE_COURSE_NOT_ALLOWED: user already has enrollment for this course')
+                started_at = datetime.utcnow().isoformat()
+                enrollment_id = str(existing_enrollment.get('enrollment_id') or '').strip()
+                if not enrollment_id:
+                    raise HTTPException(status_code=500, detail='Failed to resolve enrollment for free course conversion')
+                update_enrollment = getattr(data_service, 'update_enrollment', None)
+                if not callable(update_enrollment):
+                    raise HTTPException(status_code=500, detail='Enrollment updates are not configured')
+                await update_enrollment(
+                    enrollment_id,
+                    {
+                        'enrollment_source': 'free',
+                        'enrollment_type': 'free',
+                        'free_course_claimed_at': started_at,
+                        'last_activity': 'ลงทะเบียนเรียนฟรี',
+                    },
+                )
+                if reset_override_after_enroll:
+                    try:
+                        await _set_user_trial_override(data_service=data_service, user_id=user_id, mode='auto', updated_by='system', reason='Auto reset after successful free course enrollment')
+                    except Exception as override_exc:
+                        app_logger.warning(f'Failed to auto reset free course override after enrollment for user {user_id}: {override_exc}')
+                return {'message': 'Free course enrollment created successfully', 'enrollment_id': enrollment_id, 'user_id': user_id, 'course_id': course_id, 'enrollment_mode': 'free', 'is_free_course': True, 'expires_at': None}
+        started_at = datetime.utcnow().isoformat()
+        schedule = _build_enrollment_schedule(started_at_raw=started_at, expires_at_raw=None, duration_months_raw=None)
+        default_last_activity = 'ลงทะเบียนเรียนฟรี' if enrollment_mode_normalized == 'free' else 'เพิ่งเข้าร่วม'
+        enrollment_data = {'progress': progress, 'completed_quizzes': completed_quizzes, 'total_quizzes': total_quizzes, 'completed_questions': completed_questions, 'total_questions': total_questions, 'last_activity': f'{completed_questions}/{total_questions} คำถาม' if total_questions > 0 else default_last_activity, 'started_at': schedule['started_at'], 'enrollment_source': 'free' if enrollment_mode_normalized == 'free' else 'manual', 'enrollment_type': enrollment_mode_normalized}
+        if enrollment_mode_normalized == 'free':
+            enrollment_data['free_course_claimed_at'] = started_at
         enrollment_id = await data_service.enroll_user_in_course(user_id, course_id, enrollment_data)
-        if enrollment_mode_normalized == 'trial' and reset_trial_override_after_enroll:
+        if enrollment_mode_normalized == 'free' and reset_override_after_enroll:
             try:
-                await _set_user_trial_override(data_service=data_service, user_id=user_id, mode='auto', updated_by='system', reason='Auto reset after successful trial enrollment')
+                await _set_user_trial_override(data_service=data_service, user_id=user_id, mode='auto', updated_by='system', reason='Auto reset after successful free course enrollment')
             except Exception as override_exc:
-                app_logger.warning(f'Failed to auto reset trial override after trial enrollment for user {user_id}: {override_exc}')
-        return {'message': 'Trial enrollment created successfully' if enrollment_mode_normalized == 'trial' else 'User enrolled successfully', 'enrollment_id': enrollment_id, 'user_id': user_id, 'course_id': course_id, 'enrollment_mode': enrollment_mode_normalized, 'is_trial': enrollment_mode_normalized == 'trial', 'expires_at': schedule['expires_at']}
+                app_logger.warning(f'Failed to auto reset free course override after enrollment for user {user_id}: {override_exc}')
+        return {'message': 'Free course enrollment created successfully' if enrollment_mode_normalized == 'free' else 'User enrolled successfully', 'enrollment_id': enrollment_id, 'user_id': user_id, 'course_id': course_id, 'enrollment_mode': enrollment_mode_normalized, 'is_free_course': enrollment_mode_normalized == 'free', 'expires_at': None}
     except HTTPException:
         raise
     except Exception as e:

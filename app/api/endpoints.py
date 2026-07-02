@@ -706,6 +706,19 @@ class AdminUserTrialStatusOverrideRequest(BaseModel):
     reason: Optional[str] = None
 
 
+class AdminUserPremiumStatusRequest(BaseModel):
+    admin_user_id: str
+    tier: str = Field(..., description="free|premium")
+    expires_at: Optional[str] = None
+    duration_months: Optional[int] = Field(
+        default=None,
+        ge=1,
+        le=36,
+        description="Used when tier=premium and expires_at is omitted",
+    )
+    reason: str
+
+
 class AdminChatEnergyGlobalConfigRequest(BaseModel):
     admin_user_id: str
     daily_limit_thb: float = Field(
@@ -834,6 +847,79 @@ async def _get_user_course_enrollment(
     return None
 
 
+async def _get_all_user_enrollments(
+    dynamodb_service,
+    user_id: str,
+) -> List[Dict[str, Any]]:
+    get_with_aliases = getattr(
+        dynamodb_service, "get_user_enrollments_with_aliases", None
+    )
+    if callable(get_with_aliases):
+        return await get_with_aliases(user_id)
+    return await dynamodb_service.get_user_enrollments(user_id)
+
+
+def _is_premium_active(user: Optional[Dict[str, Any]]) -> bool:
+    if not isinstance(user, dict):
+        return False
+    subscription = user.get("premium_subscription")
+    if not isinstance(subscription, dict) or not subscription:
+        return False
+    schedule = _build_enrollment_schedule(
+        started_at_raw=subscription.get("started_at"),
+        expires_at_raw=subscription.get("expires_at"),
+        duration_months_raw=subscription.get("duration_months"),
+    )
+    if schedule["is_expired"] or not schedule.get("expires_at"):
+        return False
+    return str(subscription.get("status") or "active").strip().lower() != "expired"
+
+
+PREMIUM_TIER_MODES = ("free", "premium")
+
+
+def _build_admin_premium_summary(user: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    subscription = (
+        user.get("premium_subscription")
+        if isinstance(user, dict) and isinstance(user.get("premium_subscription"), dict)
+        else {}
+    )
+    is_active = _is_premium_active(user if isinstance(user, dict) else None)
+    schedule = _build_enrollment_schedule(
+        started_at_raw=subscription.get("started_at"),
+        expires_at_raw=subscription.get("expires_at"),
+        duration_months_raw=subscription.get("duration_months"),
+    )
+    admin_override = (
+        subscription.get("admin_override")
+        if isinstance(subscription.get("admin_override"), dict)
+        else {}
+    )
+    payment_provider = str(subscription.get("payment_provider") or "").strip().lower()
+    status_source = "none"
+    if is_active or subscription:
+        if admin_override:
+            status_source = "admin_override"
+        elif payment_provider == "stripe" or subscription.get("payment_intent_id"):
+            status_source = "payment"
+        elif payment_provider == "admin":
+            status_source = "admin_override"
+    return {
+        "tier": "premium" if is_active else "free",
+        "is_active": is_active,
+        "plan_id": subscription.get("plan_id"),
+        "plan_label": subscription.get("plan_label"),
+        "expires_at": schedule.get("expires_at"),
+        "started_at": schedule.get("started_at"),
+        "days_remaining": schedule.get("days_remaining"),
+        "is_expired": schedule.get("is_expired"),
+        "status_source": status_source,
+        "admin_override_updated_at": admin_override.get("updated_at"),
+        "admin_override_updated_by": admin_override.get("updated_by"),
+        "admin_override_reason": admin_override.get("reason"),
+    }
+
+
 async def _ensure_active_course_access(
     dynamodb_service,
     user_id: str,
@@ -846,32 +932,75 @@ async def _ensure_active_course_access(
             status_code=400, detail="Missing user_id or course_id for access check"
         )
 
+    get_user = getattr(dynamodb_service, "get_user", None)
+    user = await get_user(normalized_user_id) if callable(get_user) else None
+
+    if _is_premium_active(user):
+        enrollment = await _get_user_course_enrollment(
+            dynamodb_service=dynamodb_service,
+            user_id=normalized_user_id,
+            course_id=normalized_course_id,
+        )
+        if not enrollment:
+            lazy_enrollment_data = {
+                "progress": 0,
+                "completed_quizzes": 0,
+                "total_quizzes": 0,
+                "completed_questions": 0,
+                "total_questions": 0,
+                "last_activity": "เพิ่งเข้าร่วมด้วยสิทธิ์ Premium",
+                "enrollment_source": "premium",
+                "enrollment_type": "premium",
+            }
+            await dynamodb_service.enroll_user_in_course(
+                normalized_user_id, normalized_course_id, lazy_enrollment_data
+            )
+            enrollment = (
+                await _get_user_course_enrollment(
+                    dynamodb_service=dynamodb_service,
+                    user_id=normalized_user_id,
+                    course_id=normalized_course_id,
+                )
+                or lazy_enrollment_data
+            )
+        schedule = _build_enrollment_schedule(
+            started_at_raw=enrollment.get("started_at") or enrollment.get("enrolled_at"),
+            expires_at_raw=None,
+            duration_months_raw=None,
+        )
+        return {"enrollment": enrollment, "schedule": schedule}
+
     enrollment = await _get_user_course_enrollment(
         dynamodb_service=dynamodb_service,
         user_id=normalized_user_id,
         course_id=normalized_course_id,
     )
-    if not enrollment:
-        raise HTTPException(
-            status_code=403, detail="COURSE_ACCESS_DENIED: not enrolled in this course"
+    if enrollment and _is_free_course_enrollment(enrollment):
+        schedule = _build_enrollment_schedule(
+            started_at_raw=enrollment.get("started_at") or enrollment.get("enrolled_at"),
+            expires_at_raw=None,
+            duration_months_raw=None,
         )
-
-    schedule = _build_enrollment_schedule(
-        started_at_raw=enrollment.get("started_at") or enrollment.get("enrolled_at"),
-        expires_at_raw=enrollment.get("expires_at"),
-        duration_months_raw=enrollment.get("duration_months"),
-    )
-    if schedule["is_expired"]:
-        expired_at = schedule.get("expires_at") or "unknown"
+        return {"enrollment": enrollment, "schedule": schedule}
+    if enrollment:
         raise HTTPException(
             status_code=403,
-            detail=f"COURSE_EXPIRED: enrollment expired on {expired_at}",
+            detail="PREMIUM_REQUIRED: your Premium subscription is required to access this course",
         )
 
-    return {
-        "enrollment": enrollment,
-        "schedule": schedule,
-    }
+    all_enrollments = await _get_all_user_enrollments(dynamodb_service, normalized_user_id)
+    claimed_free_enrollment = next(
+        (row for row in all_enrollments if _is_free_course_enrollment(row)), None
+    )
+    if claimed_free_enrollment:
+        claimed_course_id = str(claimed_free_enrollment.get("course_id") or "").strip()
+        raise HTTPException(
+            status_code=403,
+            detail=f"FREE_COURSE_LIMIT: your free course is {claimed_course_id}; upgrade to Premium for full access",
+        )
+    raise HTTPException(
+        status_code=403, detail="COURSE_ACCESS_DENIED: not enrolled in this course"
+    )
 
 
 async def _ensure_user_matches_token(
@@ -968,7 +1097,7 @@ def _build_enrollment_schedule(
     }
 
 
-def _is_trial_enrollment(enrollment: Dict[str, Any]) -> bool:
+def _is_free_course_enrollment(enrollment: Dict[str, Any]) -> bool:
     source = (
         str(
             enrollment.get("enrollment_source")
@@ -978,12 +1107,9 @@ def _is_trial_enrollment(enrollment: Dict[str, Any]) -> bool:
         .strip()
         .lower()
     )
-    if source == "trial":
+    if source == "free":
         return True
-    return any(
-        bool(enrollment.get(field))
-        for field in ("trial_consumed_at", "trial_expires_at")
-    )
+    return bool(enrollment.get("free_course_claimed_at"))
 
 
 def _coerce_number(*values: Any) -> float:
@@ -1251,9 +1377,8 @@ def _format_student_course(course: Dict[str, Any]) -> Dict[str, Any]:
         "days_remaining": schedule["days_remaining"],
         "enrollment_source": course.get("enrollment_source"),
         "enrollment_type": course.get("enrollment_type"),
-        "trial_consumed_at": course.get("trial_consumed_at"),
-        "trial_expires_at": course.get("trial_expires_at"),
-        "is_trial": _is_trial_enrollment(course),
+        "free_course_claimed_at": course.get("free_course_claimed_at"),
+        "is_free_course": _is_free_course_enrollment(course),
     }
 
 
@@ -7915,12 +8040,13 @@ async def get_admin_students_overview(
             )
             amount = _safe_float(enrollment.get("paid_amount_thb"), 0.0)
             row["total_spend_thb"] += max(0.0, amount)
-            is_trial = _is_trial_enrollment(enrollment)
-            if is_trial:
+            is_free_course = _is_free_course_enrollment(enrollment)
+            if is_free_course:
                 row["trial_used"] = True
                 row["trial_courses"] += 1
                 consumed_at = str(
-                    enrollment.get("trial_consumed_at")
+                    enrollment.get("free_course_claimed_at")
+                    or enrollment.get("trial_consumed_at")
                     or enrollment.get("enrolled_at")
                     or ""
                 ).strip()
@@ -7951,9 +8077,9 @@ async def get_admin_students_overview(
                     "paid_at": enrollment.get("paid_at")
                     or enrollment.get("enrolled_at"),
                     "enrolled_at": enrollment.get("enrolled_at"),
-                    "is_trial": is_trial,
-                    "trial_consumed_at": enrollment.get("trial_consumed_at"),
-                    "trial_expires_at": enrollment.get("trial_expires_at"),
+                    "is_trial": is_free_course,
+                    "trial_consumed_at": enrollment.get("free_course_claimed_at"),
+                    "trial_expires_at": None,
                 }
             )
 
@@ -8068,6 +8194,7 @@ async def get_admin_students_overview(
             row["trial_override_updated_at"] = trial_override.get("updated_at")
             row["trial_override_updated_by"] = trial_override.get("updated_by")
             row["trial_override_reason"] = trial_override.get("reason")
+            row["premium"] = _build_admin_premium_summary(user)
             row["courses"].sort(
                 key=lambda item: str(
                     item.get("paid_at") or item.get("enrolled_at") or ""
@@ -8248,12 +8375,13 @@ async def get_admin_transactions(
                 duration_months_raw=enrollment.get("duration_months"),
             )
             enrollment_id = str(enrollment.get("enrollment_id") or "").strip()
-            trial_flag = _is_trial_enrollment(enrollment)
+            trial_flag = _is_free_course_enrollment(enrollment)
             payment_events = _normalize_payment_history(enrollment)
 
             if trial_flag:
                 trial_at = (
-                    enrollment.get("trial_consumed_at")
+                    enrollment.get("free_course_claimed_at")
+                    or enrollment.get("trial_consumed_at")
                     or enrollment.get("enrolled_at")
                     or enrollment.get("started_at")
                 )
@@ -8626,14 +8754,14 @@ async def admin_override_user_trial_status(
             normalized_user_id
         )
         trial_used_from_enrollments = any(
-            _is_trial_enrollment(enrollment) for enrollment in user_enrollments
+            _is_free_course_enrollment(enrollment) for enrollment in user_enrollments
         )
         effective_trial = _resolve_effective_trial_used(
             trial_used_from_enrollments=trial_used_from_enrollments,
             override_mode=trial_override.get("mode"),
         )
         return {
-            "message": "User trial status updated",
+            "message": "User free-course status updated",
             "user_id": normalized_user_id,
             "trial_override_mode": trial_override.get("mode"),
             "trial_override_updated_at": trial_override.get("updated_at"),
@@ -8650,6 +8778,142 @@ async def admin_override_user_trial_status(
         app_logger.error(f"Error overriding user trial status for {user_id}: {e}")
         raise HTTPException(
             status_code=500, detail="Failed to override user trial status"
+        )
+
+
+@router.put("/admin/users/{user_id}/premium-status")
+async def admin_override_user_premium_status(
+    user_id: str,
+    payload: AdminUserPremiumStatusRequest = Body(...),
+    credentials: Optional[HTTPAuthorizationCredentials] = Depends(
+        ADMIN_BEARER_OPTIONAL
+    ),
+    dynamodb_service=Depends(get_dynamodb_service),
+):
+    """Admin override for user Premium / Free tier."""
+    try:
+        normalized_user_id = str(user_id or "").strip()
+        normalized_admin_user_id = await validate_admin_actor(
+            str(payload.admin_user_id or "").strip(), credentials
+        )
+        normalized_tier = str(payload.tier or "").strip().lower()
+        normalized_reason = str(payload.reason or "").strip()
+        if not normalized_user_id:
+            raise HTTPException(status_code=400, detail="user_id is required")
+        if normalized_tier not in PREMIUM_TIER_MODES:
+            raise HTTPException(
+                status_code=400,
+                detail="tier must be one of: free, premium",
+            )
+        if not normalized_reason:
+            raise HTTPException(status_code=400, detail="reason is required")
+        if len(normalized_reason) > 500:
+            raise HTTPException(
+                status_code=400, detail="reason must be <= 500 characters"
+            )
+
+        user = await dynamodb_service.get_user(normalized_user_id)
+        if not user:
+            raise HTTPException(status_code=404, detail="User not found")
+
+        existing_subscription = (
+            user.get("premium_subscription")
+            if isinstance(user.get("premium_subscription"), dict)
+            else {}
+        )
+        previous_tier = (
+            "premium" if _is_premium_active(user) else "free"
+        )
+        now = datetime.utcnow()
+        override_event = {
+            "updated_at": now.isoformat(),
+            "updated_by": normalized_admin_user_id,
+            "reason": normalized_reason,
+            "previous_tier": previous_tier,
+            "requested_tier": normalized_tier,
+        }
+
+        if normalized_tier == "free":
+            subscription_data = dict(existing_subscription)
+            subscription_data["status"] = "expired"
+            subscription_data["expires_at"] = _format_utc_iso(now)
+            subscription_data["admin_override"] = override_event
+        else:
+            parsed_expires_at = None
+            if payload.expires_at is not None:
+                parsed_expires_at = _parse_iso_datetime(payload.expires_at)
+                if not parsed_expires_at:
+                    raise HTTPException(
+                        status_code=400,
+                        detail="expires_at must be a valid ISO datetime",
+                    )
+            duration_months = payload.duration_months
+            if parsed_expires_at is None and not duration_months:
+                duration_months = 1
+            if parsed_expires_at and parsed_expires_at <= now:
+                raise HTTPException(
+                    status_code=400,
+                    detail="expires_at must be in the future for premium tier",
+                )
+            schedule = _build_enrollment_schedule(
+                started_at_raw=now.isoformat(),
+                expires_at_raw=_format_utc_iso(parsed_expires_at)
+                if parsed_expires_at
+                else None,
+                duration_months_raw=duration_months,
+            )
+            if schedule.get("is_expired"):
+                raise HTTPException(
+                    status_code=400,
+                    detail="Premium expiry must be in the future",
+                )
+            subscription_data = dict(existing_subscription)
+            subscription_data.update(
+                {
+                    "status": "active",
+                    "plan_id": "admin",
+                    "plan_label": "Admin grant",
+                    "duration_months": schedule.get("duration_months"),
+                    "started_at": schedule.get("started_at"),
+                    "expires_at": schedule.get("expires_at"),
+                    "payment_provider": "admin",
+                    "payment_type": "admin",
+                    "paid_amount_thb": 0.0,
+                    "admin_override": override_event,
+                }
+            )
+
+        save_premium = getattr(dynamodb_service, "save_premium_subscription", None)
+        if not callable(save_premium):
+            raise HTTPException(
+                status_code=500,
+                detail="Premium subscription storage is not configured",
+            )
+        try:
+            await save_premium(normalized_user_id, subscription_data)
+        except ValueError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+        updated_user = await dynamodb_service.get_user(normalized_user_id)
+        premium_summary = _build_admin_premium_summary(updated_user)
+        return {
+            "message": "User premium status updated",
+            "user_id": normalized_user_id,
+            "tier": premium_summary.get("tier"),
+            "is_active": premium_summary.get("is_active"),
+            "expires_at": premium_summary.get("expires_at"),
+            "started_at": premium_summary.get("started_at"),
+            "days_remaining": premium_summary.get("days_remaining"),
+            "status_source": premium_summary.get("status_source"),
+            "admin_override": override_event,
+            "premium": premium_summary,
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        app_logger.error(f"Error overriding user premium status for {user_id}: {e}")
+        raise HTTPException(
+            status_code=500, detail="Failed to override user premium status"
         )
 
 
@@ -8754,10 +9018,10 @@ async def enroll_user_in_course(
         app_logger.info(f"Enrolling user {user_id} in course {course_id}")
 
         enrollment_mode_normalized = str(enrollment_mode or "standard").strip().lower()
-        if enrollment_mode_normalized not in {"standard", "trial"}:
+        if enrollment_mode_normalized not in {"standard", "free"}:
             raise HTTPException(
                 status_code=400,
-                detail="enrollment_mode must be either 'standard' or 'trial'",
+                detail="enrollment_mode must be either 'standard' or 'free'",
             )
 
         # Check if course exists
@@ -8767,58 +9031,120 @@ async def enroll_user_in_course(
 
         get_user = getattr(dynamodb_service, "get_user", None)
         user_data = await get_user(user_id) if callable(get_user) else None
-        trial_override = _extract_trial_override(user_data or {})
-        reset_trial_override_after_enroll = False
+        free_course_override = _extract_trial_override(user_data or {})
+        reset_override_after_enroll = False
 
-        if enrollment_mode_normalized == "trial":
+        if enrollment_mode_normalized == "free":
             existing_enrollment = await _get_user_course_enrollment(
                 dynamodb_service=dynamodb_service,
                 user_id=user_id,
                 course_id=course_id,
             )
-            if existing_enrollment:
-                raise HTTPException(
-                    status_code=400,
-                    detail="TRIAL_NOT_ALLOWED: user already has enrollment for this course",
+            if existing_enrollment and _is_free_course_enrollment(existing_enrollment):
+                schedule = _build_enrollment_schedule(
+                    started_at_raw=existing_enrollment.get("started_at")
+                    or existing_enrollment.get("enrolled_at"),
+                    expires_at_raw=None,
+                    duration_months_raw=None,
                 )
+                return {
+                    "message": "Free course already claimed",
+                    "enrollment_id": existing_enrollment.get("enrollment_id"),
+                    "user_id": user_id,
+                    "course_id": course_id,
+                    "enrollment_mode": "free",
+                    "is_free_course": True,
+                    "expires_at": None,
+                }
 
             user_enrollments = await dynamodb_service.get_user_enrollments(user_id)
-            trial_used_from_enrollments = any(
-                _is_trial_enrollment(enrollment) for enrollment in user_enrollments
+            free_used_from_enrollments = any(
+                _is_free_course_enrollment(enrollment) for enrollment in user_enrollments
             )
-            effective_trial = _resolve_effective_trial_used(
-                trial_used_from_enrollments=trial_used_from_enrollments,
-                override_mode=trial_override.get("mode"),
+            effective_free = _resolve_effective_trial_used(
+                trial_used_from_enrollments=free_used_from_enrollments,
+                override_mode=free_course_override.get("mode"),
             )
-            if bool(effective_trial.get("trial_used")):
-                if str(effective_trial.get("trial_status_source")) == "admin_override":
+            if bool(effective_free.get("trial_used")):
+                if str(effective_free.get("trial_status_source")) == "admin_override":
                     raise HTTPException(
                         status_code=400,
-                        detail="TRIAL_ALREADY_USED: blocked by admin override mode=used",
+                        detail="FREE_COURSE_ALREADY_CLAIMED: blocked by admin override mode=used",
                     )
+                other_free_enrollment = next(
+                    (
+                        enrollment
+                        for enrollment in user_enrollments
+                        if _is_free_course_enrollment(enrollment)
+                    ),
+                    None,
+                )
+                other_course_id = str(
+                    (other_free_enrollment or {}).get("course_id") or ""
+                ).strip()
                 raise HTTPException(
                     status_code=400,
-                    detail="TRIAL_ALREADY_USED: each user can only use trial once",
+                    detail=f"FREE_COURSE_ALREADY_CLAIMED: you already claimed {other_course_id} as your free course",
                 )
-            reset_trial_override_after_enroll = (
-                str(trial_override.get("mode") or "").strip() == "available"
+            reset_override_after_enroll = (
+                str(free_course_override.get("mode") or "").strip() == "available"
             )
+            if existing_enrollment:
+                if _is_premium_active(user_data):
+                    raise HTTPException(
+                        status_code=400,
+                        detail="FREE_COURSE_NOT_ALLOWED: user already has enrollment for this course",
+                    )
+                started_at = datetime.utcnow().isoformat()
+                enrollment_id = str(existing_enrollment.get("enrollment_id") or "").strip()
+                if not enrollment_id:
+                    raise HTTPException(
+                        status_code=500,
+                        detail="Failed to resolve enrollment for free course conversion",
+                    )
+                await dynamodb_service.update_enrollment(
+                    enrollment_id,
+                    {
+                        "enrollment_source": "free",
+                        "enrollment_type": "free",
+                        "free_course_claimed_at": started_at,
+                        "last_activity": "ลงทะเบียนเรียนฟรี",
+                    },
+                )
+                if reset_override_after_enroll:
+                    try:
+                        await _set_user_trial_override(
+                            dynamodb_service=dynamodb_service,
+                            user_id=user_id,
+                            mode="auto",
+                            updated_by="system",
+                            reason="Auto reset after successful free course enrollment",
+                        )
+                    except Exception as override_exc:
+                        app_logger.warning(
+                            "Failed to auto reset free course override after enrollment "
+                            f"for user {user_id}: {override_exc}"
+                        )
+                return {
+                    "message": "Free course enrollment created successfully",
+                    "enrollment_id": enrollment_id,
+                    "user_id": user_id,
+                    "course_id": course_id,
+                    "enrollment_mode": "free",
+                    "is_free_course": True,
+                    "expires_at": None,
+                }
 
         # Prepare enrollment data
-        now = datetime.utcnow()
-        trial_started_at = now.isoformat()
-        trial_expires_at = None
-        if enrollment_mode_normalized == "trial":
-            trial_expires_at = (now + timedelta(days=1)).isoformat()
-
+        started_at = datetime.utcnow().isoformat()
         schedule = _build_enrollment_schedule(
-            started_at_raw=trial_started_at,
-            expires_at_raw=trial_expires_at,
+            started_at_raw=started_at,
+            expires_at_raw=None,
             duration_months_raw=None,
         )
         default_last_activity = (
-            "เริ่มทดลองเรียน"
-            if enrollment_mode_normalized == "trial"
+            "ลงทะเบียนเรียนฟรี"
+            if enrollment_mode_normalized == "free"
             else "เพิ่งเข้าร่วม"
         )
         enrollment_data = {
@@ -8833,47 +9159,45 @@ async def enroll_user_in_course(
                 else default_last_activity
             ),
             "started_at": schedule["started_at"],
-            "expires_at": schedule["expires_at"],
-            "enrollment_source": "trial"
-            if enrollment_mode_normalized == "trial"
+            "enrollment_source": "free"
+            if enrollment_mode_normalized == "free"
             else "manual",
             "enrollment_type": enrollment_mode_normalized,
         }
-        if enrollment_mode_normalized == "trial":
-            enrollment_data["trial_consumed_at"] = trial_started_at
-            enrollment_data["trial_expires_at"] = schedule["expires_at"]
+        if enrollment_mode_normalized == "free":
+            enrollment_data["free_course_claimed_at"] = started_at
 
         enrollment_id = await dynamodb_service.enroll_user_in_course(
             user_id, course_id, enrollment_data
         )
 
-        if enrollment_mode_normalized == "trial" and reset_trial_override_after_enroll:
+        if enrollment_mode_normalized == "free" and reset_override_after_enroll:
             try:
                 await _set_user_trial_override(
                     dynamodb_service=dynamodb_service,
                     user_id=user_id,
                     mode="auto",
                     updated_by="system",
-                    reason="Auto reset after successful trial enrollment",
+                    reason="Auto reset after successful free course enrollment",
                 )
             except Exception as override_exc:
                 app_logger.warning(
-                    "Failed to auto reset trial override after trial enrollment "
+                    "Failed to auto reset free course override after enrollment "
                     f"for user {user_id}: {override_exc}"
                 )
 
         return {
             "message": (
-                "Trial enrollment created successfully"
-                if enrollment_mode_normalized == "trial"
+                "Free course enrollment created successfully"
+                if enrollment_mode_normalized == "free"
                 else "User enrolled successfully"
             ),
             "enrollment_id": enrollment_id,
             "user_id": user_id,
             "course_id": course_id,
             "enrollment_mode": enrollment_mode_normalized,
-            "is_trial": enrollment_mode_normalized == "trial",
-            "expires_at": schedule["expires_at"],
+            "is_free_course": enrollment_mode_normalized == "free",
+            "expires_at": None,
         }
 
     except HTTPException:

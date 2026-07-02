@@ -7,8 +7,8 @@ from fastapi import APIRouter
 
 from app.api.chat_endpoints import send_chat_message
 from app.api.student_handlers import (
-    confirm_promptpay_payment_and_enroll,
-    create_promptpay_payment_intent,
+    confirm_premium_promptpay_payment,
+    create_premium_promptpay_payment_intent,
     enroll_user_in_course,
     get_course_learning_overview,
     get_course_lessons,
@@ -19,6 +19,7 @@ from app.api.student_handlers import (
     get_terms_of_use,
     get_user_enrolled_courses,
     get_user_payment_history,
+    get_user_premium_subscription,
     get_user_quiz_results,
     get_dashboard_learning_summary,
     get_student_chat_energy_status,
@@ -99,18 +100,23 @@ router.add_api_route(
     get_user_payment_history,
     methods=["GET"],
 )
+router.add_api_route(
+    "/student/users/{user_id}/premium-subscription",
+    get_user_premium_subscription,
+    methods=["GET"],
+)
 
 router.add_api_route(
     "/student/enrollments", enroll_user_in_course, methods=["POST"]
 )
 router.add_api_route(
-    "/student/payments/promptpay/create-intent",
-    create_promptpay_payment_intent,
+    "/student/payments/premium/promptpay/create-intent",
+    create_premium_promptpay_payment_intent,
     methods=["POST"],
 )
 router.add_api_route(
-    "/student/payments/promptpay/confirm",
-    confirm_promptpay_payment_and_enroll,
+    "/student/payments/premium/promptpay/confirm",
+    confirm_premium_promptpay_payment,
     methods=["POST"],
 )
 router.add_api_route(
