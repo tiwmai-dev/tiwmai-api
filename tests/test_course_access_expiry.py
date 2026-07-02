@@ -24,26 +24,51 @@ class FakeDataService:
     def __init__(self, mode: str):
         self.mode = mode
 
+    async def get_user(self, user_id):
+        if user_id != USER_ID:
+            return None
+        if self.mode == "active":
+            return {
+                "user_id": USER_ID,
+                "premium_subscription": {
+                    "status": "active",
+                    "started_at": (datetime.utcnow() - timedelta(days=10)).isoformat(),
+                    "expires_at": (datetime.utcnow() + timedelta(days=5)).isoformat(),
+                },
+            }
+        return {"user_id": USER_ID}
+
     async def get_user_enrollments(self, user_id):
         if user_id != USER_ID:
             return []
         if self.mode == "not_enrolled":
             return []
-        expires_at = (
-            datetime.utcnow() + timedelta(days=5)
-            if self.mode == "active"
-            else datetime.utcnow() - timedelta(days=1)
-        ).isoformat()
+        if self.mode == "active":
+            return [
+                {
+                    "enrollment_id": "enr-1",
+                    "user_id": USER_ID,
+                    "course_id": COURSE_ID,
+                    "status": "active",
+                    "enrollment_source": "premium",
+                    "started_at": (datetime.utcnow() - timedelta(days=10)).isoformat(),
+                }
+            ]
+        # "expired" mode: a stale non-free enrollment row with no active Premium
+        # (e.g. a lapsed Premium subscription) must still be denied access.
         return [
             {
                 "enrollment_id": "enr-1",
                 "user_id": USER_ID,
                 "course_id": COURSE_ID,
                 "status": "active",
+                "enrollment_source": "premium",
                 "started_at": (datetime.utcnow() - timedelta(days=10)).isoformat(),
-                "expires_at": expires_at,
             }
         ]
+
+    async def enroll_user_in_course(self, user_id, course_id, enrollment_data):
+        return "enr-new-1"
 
     async def get_course_lessons(self, course_id, user_id=None):
         return [
@@ -183,7 +208,7 @@ async def test_expired_enrollment_is_blocked(runner):
     with pytest.raises(HTTPException) as exc:
         await runner(db, _credentials(), _auth_with_matching_user())
     assert exc.value.status_code == 403
-    assert "COURSE_EXPIRED" in str(exc.value.detail)
+    assert "PREMIUM_REQUIRED" in str(exc.value.detail)
 
 
 @pytest.mark.unit

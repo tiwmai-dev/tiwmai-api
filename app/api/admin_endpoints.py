@@ -11,6 +11,7 @@ ADMIN_ROUTE_PATHS = (
     "/admin/chat-energy/settings",
     "/admin/users/{user_id}/chat-energy",
     "/admin/users/{user_id}/trial-status",
+    "/admin/users/{user_id}/premium-status",
     "/admin/enrollments/{enrollment_id}/expiry",
 )
 

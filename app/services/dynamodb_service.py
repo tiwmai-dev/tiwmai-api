@@ -930,6 +930,20 @@ class SupabaseDataService:
         item.setdefault("created_at", now)
         return await self._upsert("profiles", item)
 
+    async def save_premium_subscription(
+        self,
+        user_id: str,
+        subscription: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        now = _utcnow()
+        existing = await self.get_user(user_id)
+        if not existing:
+            raise ValueError(f"User {user_id} not found")
+        item = dict(existing)
+        item["premium_subscription"] = subscription
+        item["updated_at"] = now
+        return await self._upsert("profiles", item)
+
     async def get_student_onboarding(
         self,
         user_id: str,

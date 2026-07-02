@@ -54,15 +54,15 @@ async def test_required_user_token_rejects_mismatched_user():
     assert getattr(exc_info.value, "detail", None) == "USER_ID_TOKEN_MISMATCH"
 
 
-def test_promptpay_create_intent_requires_bearer_token_before_payment_work():
+def test_premium_promptpay_create_intent_requires_bearer_token_before_payment_work():
     app = create_app(Settings(secret_key="test-secret", debug=True))
     client = TestClient(app)
 
     response = client.post(
-        "/api/v1/student/payments/promptpay/create-intent",
+        "/api/v1/student/payments/premium/promptpay/create-intent",
         json={
             "user_id": "student-1",
-            "course_id": "course-1",
+            "plan_id": "1m",
             "amount_thb": 199,
         },
     )

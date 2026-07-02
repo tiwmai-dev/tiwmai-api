@@ -14,7 +14,7 @@ def test_student_route_surface_is_registered():
     assert "/api/v1/student/courses/{course_id}/learning-overview" in paths
     assert "/api/v1/student/users/{user_id}/enrolled-courses" in paths
     assert "/api/v1/student/users/{user_id}/quizzes/{quiz_id}/submit" in paths
-    assert "/api/v1/student/payments/promptpay/create-intent" in paths
+    assert "/api/v1/student/payments/premium/promptpay/create-intent" in paths
     assert "/api/v1/student/chat" in paths
 
 
